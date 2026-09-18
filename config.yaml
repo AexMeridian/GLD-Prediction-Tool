@@ -1,0 +1,91 @@
+# Gold Edge configuration. All engine/model thresholds live here — never
+# hardcode them in code. See CLAUDE.md for what each one means.
+
+kalshi:
+  rest_base: "https://api.elections.kalshi.com/trade-api/v2"
+  ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  series_ticker: "KXGOLD15M"
+
+pyth:
+  # Host requires PYTH_API_KEY (Authorization: Bearer) as of the Aug 2026
+  # Pyth Core upgrade. See docs/contract_notes.md.
+  hermes_base: "https://pyth.dourolabs.app/hermes"
+  # Kalshi's KXGOLD15M series actually settles on Metal.Index.1OZGOLD/USD
+  # (a paid "Index" feed — see docs/contract_notes.md #3), but the user's
+  # Pyth plan is free-tier and can't access Index feeds (403 "Not
+  # entitled... requires ... pyth-indices"). Decision 2026-09-17: run on
+  # the free standard XAU/USD feed as an approximation rather than pay for
+  # the upgrade. This WILL make windows.py's settlement-source check warn
+  # continuously — that's correct, not a bug, since the live feed genuinely
+  # no longer matches the settlement feed. Switch back to
+  # Metal.Index.1OZGOLD/USD (id
+  # 7fd2c87083dd8fd5af2486a43f40b8e444acd77fda4e96263a53421cd079c387) the
+  # moment the Pyth plan is upgraded.
+  price_feed_symbol: "Metal.XAU/USD"
+  price_feed_id: "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"
+  # Search term for re-looking up this feed's metadata (market_hours, used
+  # to detect the daily trading halt independent of message-arrival gaps).
+  # Must uniquely match exactly the feed above via /v2/price_feeds.
+  price_feed_query: "XAU"
+
+fees:
+  # fee = ceil_to_cent(fee_multiplier * 0.07 * contracts * price * (1 - price))
+  # fee_multiplier (M) is per-market; confirm against the live series before
+  # trusting this default (currently 1 for KXGOLD15M, see contract_notes.md).
+  base_rate: 0.07
+  fee_multiplier: 1.0
+  maker_fees_enabled: true
+
+volatility:
+  ewma_half_life_s: 60
+  short_horizon_s: 60
+  min_sigma_per_minute: 0.0005
+  vol_spike_limit: 0.01
+
+model:
+  min_fair_value: 0.01
+  max_fair_value: 0.99
+
+engine:
+  enter_edge: 0.03
+  persist_s: 1.5
+  cooldown_s: 20
+  entry_cutoff_s: 90
+  exit_cutoff_s: 75
+  stale_s: 3.0
+  max_spread: 0.04
+  max_round_trips: 6
+  daily_loss_stop: 25.0
+  converge_band: 0.01
+  stop: 0.08
+  hold_to_settlement_when_itm: true
+  hold_to_settlement_fair_threshold: 0.90
+  signal_ttl_s: 6.0
+
+backtest:
+  human_delay_min_s: 1.0
+  human_delay_max_s: 2.0
+
+learning:
+  min_opportunity: 0.03
+  min_bucket_n: 30
+  exit_regret: 0.02
+  min_proposal_trades: 200
+  promotion_margin: 0.01
+  max_dd_worsen: 0.10
+  shadow_sessions: 10
+  filter_min_prob: 0.55
+  # Markouts (learning/markouts.py): seconds after a signal to sample
+  # market/model state at, per CLAUDE.md's "+5/+15/+30/+60s" spec.
+  markout_horizons_s: [5.0, 15.0, 30.0, 60.0]
+  # Attribution (learning/attribution.py): a GOOD_BUT_UNLUCKY round trip is
+  # tagged news_vol_shock instead of plain volatility when the edge_markout
+  # swing between its shortest and longest horizon is at least this large --
+  # a proxy for "the market whipsawed fast" vs. "it drifted the wrong way."
+  news_shock_threshold: 0.08
+
+recording:
+  sqlite_path: "data/gold_edge.sqlite"
+  parquet_dir: "data/parquet"
+
+live_trading: false

@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Gold Edge</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --border: #dde1e6;
+    --text: #14171a;
+    --muted: #6b7280;
+    --yes: #0f9d58;
+    --no: #d93025;
+    --hold: #6b7280;
+    --accent: #2563eb;
+    --warn: #b45309;
+    --danger: #b3261e;
+  }
+  html[data-theme="dark"] {
+    --bg: #0f1216;
+    --panel: #171b21;
+    --border: #2a2f37;
+    --text: #e8eaed;
+    --muted: #9aa4b2;
+    --yes: #3ddc84;
+    --no: #ff6b6b;
+    --hold: #9aa4b2;
+    --accent: #6ea8fe;
+    --warn: #f5b942;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    padding: 12px 16px 40px;
+  }
+  .top-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px;
+  }
+  .top-bar h1 { font-size: 18px; margin: 0; }
+  .top-bar .controls { display: flex; gap: 8px; align-items: center; }
+  button {
+    font: inherit; border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); border-radius: 6px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  button.danger { background: var(--danger); color: white; border-color: var(--danger); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 12px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--muted); margin: 0 0 10px;
+  }
+
+  /* Action card */
+  #action-card { text-align: center; padding: 20px; transition: background 0.2s; }
+  #action-text { font-size: 40px; font-weight: 800; letter-spacing: 0.02em; }
+  #action-text.buy-yes { color: var(--yes); }
+  #action-text.buy-no { color: var(--no); }
+  #action-text.sell { color: var(--accent); }
+  #action-text.hold { color: var(--hold); }
+  #action-text.missed { color: var(--muted); text-decoration: line-through; }
+  #action-meta { margin-top: 8px; color: var(--muted); font-size: 14px; }
+  #action-ttl { font-size: 13px; margin-top: 4px; color: var(--muted); }
+
+  /* Fill buttons */
+  #fill-row { display: flex; gap: 10px; align-items: center; justify-content: center; flex-wrap: wrap; }
+  #fill-row input[type=number] {
+    width: 90px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+
+  /* Window bar */
+  .window-bar { display: flex; gap: 24px; flex-wrap: wrap; font-size: 14px; }
+  .window-bar .stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+  .window-bar .stat .value { font-size: 16px; font-weight: 600; }
+
+  /* Chart */
+  #chart-wrap { position: relative; }
+  canvas#chart { width: 100%; height: 220px; display: block; }
+
+  /* Fair vs market */
+  table.fv-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.fv-table th, table.fv-table td { text-align: right; padding: 6px 8px; }
+  table.fv-table th:first-child, table.fv-table td:first-child { text-align: left; }
+  table.fv-table tr + tr td { border-top: 1px solid var(--border); }
+
+  /* Position */
+  #position-body .empty { color: var(--muted); }
+  .pnl-pos { color: var(--yes); }
+  .pnl-neg { color: var(--no); }
+
+  /* Session log */
+  #session-log { max-height: 260px; overflow-y: auto; font-size: 13px; }
+  .log-row { display: flex; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+  .log-row .t { color: var(--muted); width: 70px; flex-shrink: 0; }
+  .log-row .kind { width: 90px; flex-shrink: 0; font-weight: 600; text-transform: uppercase; font-size: 11px; }
+  .kind-signal_issued { color: var(--accent); }
+  .kind-filled { color: var(--yes); }
+  .kind-skipped, .kind-expired { color: var(--muted); }
+  .kind-warning { color: var(--warn); }
+  .kind-window { color: var(--muted); font-style: italic; }
+
+  /* Status */
+  #status-row { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+  .dot.ok { background: var(--yes); }
+  .dot.stale { background: var(--danger); }
+
+  .footer-note {
+    color: var(--muted); font-size: 11px; text-align: center; margin-top: 20px;
+  }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+  .tab-btn {
+    font: inherit; border: 1px solid var(--border); background: transparent;
+    color: var(--muted); border-radius: 6px; padding: 6px 14px; cursor: pointer;
+  }
+  .tab-btn.active { background: var(--panel); color: var(--text); border-color: var(--accent); }
+  .tab-page { display: none; }
+  .tab-page.active { display: block; }
+  #version-badge {
+    font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 10px; padding: 2px 8px; margin-left: 8px;
+  }
+  #drift-banner {
+    background: var(--warn); color: #1a1400; border-radius: 8px; padding: 8px 12px;
+    margin-bottom: 12px; font-size: 13px;
+  }
+  html[data-theme="dark"] #drift-banner { color: #14171a; }
+
+  /* Review / Learning */
+  .review-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .review-controls input[type=date] {
+    padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+  #review-report {
+    white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+    line-height: 1.5;
+  }
+  table.learn-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 6px; }
+  table.learn-table th, table.learn-table td { text-align: left; padding: 5px 8px; }
+  table.learn-table th { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+  table.learn-table tr + tr td { border-top: 1px solid var(--border); }
+  .proposal-card {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+  }
+  .proposal-card .rationale { margin-bottom: 6px; }
+  .proposal-card .meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .proposal-card .result { margin-top: 6px; font-size: 12px; }
+  .badge { display: inline-block; border-radius: 10px; padding: 1px 8px; font-size: 11px; }
+  .badge.pending { background: var(--border); color: var(--muted); }
+  .badge.approved { background: var(--yes); color: white; }
+  .badge.rejected { background: var(--no); color: white; }
+</style>
+</head>
+<body>
+
+<div class="top-bar">
+  <h1>Gold Edge <span id="version-badge" hidden></span></h1>
+  <div class="controls">
+    <span id="conn-indicator" style="font-size:12px;color:var(--muted);">connecting…</span>
+    <button id="theme-toggle">Theme</button>
+    <button id="mute-toggle">Mute</button>
+    <button id="kill-switch" class="danger">Kill switch: OFF</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" data-tab="live">Live</button>
+  <button class="tab-btn" data-tab="review">Review</button>
+  <button class="tab-btn" data-tab="learning">Learning</button>
+</div>
+
+<div id="tab-live" class="tab-page active">
+
+<div id="drift-banner" hidden></div>
+
+<!-- 1. Action card -->
+<div class="panel" id="action-card">
+  <div id="action-text" class="hold">HOLD</div>
+  <div id="action-meta">—</div>
+  <div id="action-ttl"></div>
+</div>
+
+<!-- 2. Fill buttons -->
+<div class="panel" id="fill-panel">
+  <h2>Log your fill</h2>
+  <div id="fill-row">
+    <span id="fill-hint" style="color:var(--muted);">No pending signal.</span>
+  </div>
+</div>
+
+<!-- 3. Window bar -->
+<div class="panel">
+  <h2>Window</h2>
+  <div class="window-bar">
+    <div class="stat"><div class="label">Ticker</div><div class="value" id="w-ticker">—</div></div>
+    <div class="stat"><div class="label">S0</div><div class="value" id="w-s0">—</div></div>
+    <div class="stat"><div class="label">Live S</div><div class="value" id="w-s">—</div></div>
+    <div class="stat"><div class="label">Closes in</div><div class="value" id="w-closes">—</div></div>
+    <div class="stat"><div class="label">Entry cutoff</div><div class="value" id="w-cutoff">—</div></div>
+  </div>
+</div>
+
+<!-- 4. Chart -->
+<div class="panel">
+  <h2>Live price vs S0</h2>
+  <div id="chart-wrap"><canvas id="chart"></canvas></div>
+</div>
+
+<!-- 5. Fair vs market -->
+<div class="panel">
+  <h2>Fair value vs market</h2>
+  <table class="fv-table">
+    <thead><tr><th></th><th>Fair</th><th>Bid</th><th>Ask</th></tr></thead>
+    <tbody>
+      <tr><td>YES</td><td id="fv-yes-fair">—</td><td id="fv-yes-bid">—</td><td id="fv-yes-ask">—</td></tr>
+      <tr><td>NO</td><td id="fv-no-fair">—</td><td id="fv-no-bid">—</td><td id="fv-no-ask">—</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- 6. Position -->
+<div class="panel">
+  <h2>Position</h2>
+  <div id="position-body"><span class="empty">Flat.</span></div>
+</div>
+
+<!-- 7. Session log -->
+<div class="panel">
+  <h2>Session log</h2>
+  <div id="session-log"></div>
+</div>
+
+<!-- 8. Status -->
+<div class="panel">
+  <h2>Status</h2>
+  <div id="status-row">
+    <span><span class="dot" id="pyth-dot"></span>Pyth <span id="pyth-age">—</span></span>
+    <span><span class="dot" id="kalshi-dot"></span>Kalshi <span id="kalshi-age">—</span></span>
+    <span>Round trips: <span id="round-trips">0</span></span>
+    <span>Realized P&amp;L today: <span id="realized-pnl">$0.00</span></span>
+  </div>
+  <div id="status-row-2" style="margin-top:8px;">
+    <span id="settlement-source-warning" hidden style="color:var(--warn);">
+      ⚠ Live price feed may not exactly match Kalshi's settlement source (see docs/contract_notes.md)
+    </span>
+    <span id="market-closed-warning" hidden style="color:var(--danger);">
+      ⚠ Underlying gold market is currently closed (daily feed pause) — price is not trustworthy right now
+    </span>
+  </div>
+</div>
+
+</div><!-- /tab-live -->
+
+<div id="tab-review" class="tab-page">
+  <div class="panel">
+    <h2>Session review</h2>
+    <div class="review-controls">
+      <label>From <input type="date" id="review-start" /></label>
+      <label>To <input type="date" id="review-end" /></label>
+      <button id="review-load" class="primary">Load</button>
+    </div>
+    <div id="review-report">Pick a date range (or leave blank for everything) and click Load.</div>
+  </div>
+</div>
+
+<div id="tab-learning" class="tab-page">
+  <div class="panel">
+    <h2>Drift status</h2>
+    <div id="learning-drift">No drift check has run yet.</div>
+  </div>
+  <div class="panel">
+    <h2>Significant patterns</h2>
+    <div id="learning-patterns">No significant patterns yet — run <code>learn</code> first.</div>
+  </div>
+  <div class="panel">
+    <h2>Proposals</h2>
+    <div id="learning-proposals">No proposals yet.</div>
+  </div>
+  <div class="panel">
+    <h2>Version history</h2>
+    <div id="learning-versions">No config versions promoted yet.</div>
+    <button id="learning-rollback" style="margin-top:8px;">Roll back to previous version</button>
+  </div>
+  <button id="learning-refresh">Refresh</button>
+</div>
+
+<div class="footer-note">
+  Signals are model output, not financial advice. Kalshi contracts can lose their full value.
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- theme ----------
+  const root = document.documentElement;
+  function applyTheme(t) { root.setAttribute("data-theme", t); localStorage.setItem("ge-theme", t); }
+  applyTheme(localStorage.getItem("ge-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+  document.getElementById("theme-toggle").addEventListener("click", () => {
+    applyTheme(root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+  });
+
+  // ---------- audio ----------
+  let muted = localStorage.getItem("ge-muted") === "1";
+  function updateMuteLabel() { document.getElementById("mute-toggle").textContent = muted ? "Unmute" : "Mute"; }
+  updateMuteLabel();
+  document.getElementById("mute-toggle").addEventListener("click", () => {
+    muted = !muted; localStorage.setItem("ge-muted", muted ? "1" : "0"); updateMuteLabel();
+  });
+  let audioCtx = null;
+  function tone(freq, durMs, type) {
+    if (muted) return;
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type || "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durMs / 1000);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + durMs / 1000);
+    } catch (e) { /* ignore autoplay-policy errors until first user gesture */ }
+  }
+  function playActionTone(action, side) {
+    if (action === "BUY" && side === "YES") tone(880, 220, "sine");
+    else if (action === "BUY" && side === "NO") tone(660, 220, "sine");
+    else if (action === "SELL") tone(520, 300, "triangle");
+  }
+
+  // ---------- kill switch ----------
+  let killSwitch = false;
+  document.getElementById("kill-switch").addEventListener("click", async () => {
+    await fetch("/api/kill_switch", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !killSwitch }),
+    });
+  });
+
+  // ---------- formatting helpers ----------
+  const fmtPrice = (v) => (v === null || v === undefined) ? "—" : Number(v).toFixed(2);
+  const fmtMoney = (v) => (v === null || v === undefined) ? "—" : (v >= 0 ? "$" + v.toFixed(2) : "-$" + Math.abs(v).toFixed(2));
+  function fmtSeconds(s) {
+    if (s === null || s === undefined) return "—";
+    s = Math.max(0, Math.round(s));
+    const m = Math.floor(s / 60), r = s % 60;
+    return m > 0 ? `${m}m ${r}s` : `${r}s`;
+  }
+
+  // ---------- chart ----------
+  const canvas = document.getElementById("chart");
+  const priceHistory = []; // {t: ms, s: number}
+  const HISTORY_MS = 15 * 60 * 1000;
+  function pushPrice(s, atIso) {
+    if (s === null || s === undefined) return;
+    const t = atIso ? Date.parse(atIso) : Date.now();
+    priceHistory.push({ t, s });
+    const cutoff = Date.now() - HISTORY_MS;
+    while (priceHistory.length && priceHistory[0].t < cutoff) priceHistory.shift();
+  }
+  function drawChart(s0) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight || 220;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const styles = getComputedStyle(root);
+    ctx.strokeStyle = styles.getPropertyValue("--border");
+    ctx.lineWidth = 1;
+
+    if (priceHistory.length < 2) {
+      ctx.fillStyle = styles.getPropertyValue("--muted");
+      ctx.fillText("Waiting for price data…", 10, h / 2);
+      return;
+    }
+    const values = priceHistory.map((p) => p.s).concat(s0 !== null && s0 !== undefined ? [s0] : []);
+    let min = Math.min(...values), max = Math.max(...values);
+    if (min === max) { min -= 1; max += 1; }
+    const pad = (max - min) * 0.1 || 1;
+    min -= pad; max += pad;
+    const t0 = priceHistory[0].t, t1 = priceHistory[priceHistory.length - 1].t || t0 + 1;
+    const x = (t) => ((t - t0) / Math.max(1, t1 - t0)) * (w - 20) + 10;
+    const y = (v) => h - 20 - ((v - min) / (max - min)) * (h - 30);
+
+    if (s0 !== null && s0 !== undefined) {
+      ctx.strokeStyle = styles.getPropertyValue("--muted");
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(10, y(s0)); ctx.lineTo(w - 10, y(s0)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = styles.getPropertyValue("--accent");
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    priceHistory.forEach((p, i) => { const px = x(p.t), py = y(p.s); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
+    ctx.stroke();
+  }
+
+  // ---------- rendering ----------
+  let currentSignal = null;
+  let lastSeenSignalId = null;
+  let currentWindow = null;
+
+  function renderActionCard(state) {
+    const el = document.getElementById("action-text");
+    const meta = document.getElementById("action-meta");
+    const ttlEl = document.getElementById("action-ttl");
+    const sig = state.signal;
+    if (!sig) {
+      el.textContent = "HOLD"; el.className = "hold";
+      meta.textContent = "No actionable edge right now.";
+      ttlEl.textContent = "";
+      return;
+    }
+    let label, cls;
+    if (sig.action === "BUY" && sig.side === "YES") { label = "▲ BUY YES"; cls = "buy-yes"; }
+    else if (sig.action === "BUY" && sig.side === "NO") { label = "▼ BUY NO"; cls = "buy-no"; }
+    else { label = "✓ SELL " + sig.side; cls = "sell"; }
+    el.textContent = label; el.className = cls;
+    meta.textContent = `limit ${fmtPrice(sig.limit_price)} · size ${sig.size} · edge ${sig.edge_after_costs.toFixed(3)} · ${sig.reason}`;
+  }
+
+  function tickCountdown() {
+    const sig = currentSignal;
+    const ttlEl = document.getElementById("action-ttl");
+    if (!sig) { ttlEl.textContent = ""; return; }
+    const msLeft = Date.parse(sig.expires_at) - Date.now();
+    if (msLeft <= 0) { ttlEl.textContent = "expiring…"; return; }
+    ttlEl.textContent = `expires in ${(msLeft / 1000).toFixed(1)}s`;
+  }
+  setInterval(tickCountdown, 100);
+
+  function renderFillRow(state) {
+    const row = document.getElementById("fill-row");
+    const sig = state.signal;
+    if (!sig) {
+      row.innerHTML = '<span id="fill-hint" style="color:var(--muted);">No pending signal.</span>';
+      return;
+    }
+    const verb = sig.action === "BUY" ? "bought" : "sold";
+    row.innerHTML = `
+      <label>I ${verb} at
+        <input type="number" step="0.01" id="fill-price" value="${sig.limit_price}" />
+      </label>
+      <button class="primary" id="fill-confirm">Confirm ${sig.action} ${sig.side}</button>
+      <button id="fill-skip">Skipped</button>
+    `;
+    document.getElementById("fill-confirm").addEventListener("click", async () => {
+      const price = parseFloat(document.getElementById("fill-price").value);
+      await fetch("/api/fill", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ signal_id: sig.id, action: sig.action, price: price, size: sig.size }),
+      });
+    });
+    document.getElementById("fill-skip").addEventListener("click", async () => {
+      await fetch("/api/skip", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ signal_id: sig.id }),
+      });
+    });
+  }
+
+  function renderWindowBar(state) {
+    const w = state.window;
+    document.getElementById("w-ticker").textContent = w ? w.ticker : "—";
+    document.getElementById("w-s0").textContent = w && w.s0 !== null ? w.s0.toFixed(2) : "—";
+    document.getElementById("w-s").textContent = state.market && state.market.s !== null && state.market.s !== undefined
+      ? state.market.s.toFixed(2) : "—";
+    if (w) {
+      const closesInS = (Date.parse(w.close_time) - Date.now()) / 1000;
+      document.getElementById("w-closes").textContent = fmtSeconds(closesInS);
+      document.getElementById("w-cutoff").textContent = closesInS < 90 ? "past entry cutoff" : "open";
+    } else {
+      document.getElementById("w-closes").textContent = "—";
+      document.getElementById("w-cutoff").textContent = "—";
+    }
+  }
+
+  function renderFairVsMarket(state) {
+    const fair = state.fair, m = state.market || {};
+    document.getElementById("fv-yes-fair").textContent = fair ? fair.yes.toFixed(3) : "—";
+    document.getElementById("fv-no-fair").textContent = fair ? fair.no.toFixed(3) : "—";
+    document.getElementById("fv-yes-bid").textContent = fmtPrice(m.yes_bid);
+    document.getElementById("fv-yes-ask").textContent = fmtPrice(m.yes_ask);
+    document.getElementById("fv-no-bid").textContent = fmtPrice(m.no_bid);
+    document.getElementById("fv-no-ask").textContent = fmtPrice(m.no_ask);
+  }
+
+  function renderPosition(state) {
+    const el = document.getElementById("position-body");
+    const p = state.position;
+    if (!p) { el.innerHTML = '<span class="empty">Flat.</span>'; return; }
+    const pnlCls = (p.unrealized_pnl || 0) >= 0 ? "pnl-pos" : "pnl-neg";
+    el.innerHTML = `
+      <div>Side: <strong>${p.side}</strong> &nbsp; Size: ${p.size} &nbsp; Entry: ${fmtPrice(p.entry_price)}</div>
+      <div>Unrealized P&amp;L: <span class="${pnlCls}">${fmtMoney(p.unrealized_pnl)}</span></div>
+    `;
+  }
+
+  const renderedLogIds = new Set();
+  function renderSessionLog(state) {
+    const container = document.getElementById("session-log");
+    const entries = state.session_log || [];
+    for (const entry of entries) {
+      if (renderedLogIds.has(entry.id)) continue;
+      renderedLogIds.add(entry.id);
+      const row = document.createElement("div");
+      row.className = "log-row";
+      const time = new Date(entry.at).toLocaleTimeString();
+      let detail = "";
+      try { detail = JSON.stringify(entry.payload); } catch (e) { detail = String(entry.payload); }
+      row.innerHTML = `<span class="t">${time}</span><span class="kind kind-${entry.kind}">${entry.kind}</span><span>${detail}</span>`;
+      container.prepend(row);
+    }
+    while (container.children.length > 200) container.removeChild(container.lastChild);
+  }
+
+  function renderStatus(state) {
+    const fs = state.feed_status || {};
+    document.getElementById("pyth-dot").className = "dot " + (fs.pyth_stale ? "stale" : "ok");
+    document.getElementById("kalshi-dot").className = "dot " + (fs.kalshi_stale ? "stale" : "ok");
+    document.getElementById("pyth-age").textContent = fs.pyth_age_s != null ? fs.pyth_age_s.toFixed(1) + "s" : "—";
+    document.getElementById("kalshi-age").textContent = fs.kalshi_age_s != null ? fs.kalshi_age_s.toFixed(1) + "s" : "—";
+    document.getElementById("settlement-source-warning").hidden = fs.settlement_source_ok !== false;
+    document.getElementById("market-closed-warning").hidden = fs.pyth_market_open !== false;
+    const session = state.session || {};
+    document.getElementById("round-trips").textContent = session.round_trips ?? 0;
+    const pnlEl = document.getElementById("realized-pnl");
+    pnlEl.textContent = fmtMoney(session.realized_pnl_today ?? 0);
+    pnlEl.className = (session.realized_pnl_today || 0) >= 0 ? "pnl-pos" : "pnl-neg";
+    killSwitch = !!session.kill_switch;
+    const btn = document.getElementById("kill-switch");
+    btn.textContent = "Kill switch: " + (killSwitch ? "ON" : "OFF");
+    btn.style.background = killSwitch ? "var(--danger)" : "";
+  }
+
+  function render(state) {
+    currentWindow = state.window;
+    const newSig = state.signal;
+    if (newSig && newSig.id !== lastSeenSignalId) {
+      playActionTone(newSig.action, newSig.side);
+      lastSeenSignalId = newSig.id;
+    }
+    if (!newSig) lastSeenSignalId = null;
+    currentSignal = newSig;
+
+    if (state.market) pushPrice(state.market.s, state.generated_at);
+
+    renderActionCard(state);
+    renderFillRow(state);
+    renderWindowBar(state);
+    renderFairVsMarket(state);
+    renderPosition(state);
+    renderSessionLog(state);
+    renderStatus(state);
+    drawChart(state.window ? state.window.s0 : null);
+  }
+
+  // ---------- websocket ----------
+  const connIndicator = document.getElementById("conn-indicator");
+  let ws = null;
+  let backoff = 1000;
+
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+    ws.onopen = () => { connIndicator.textContent = "live"; backoff = 1000; };
+    ws.onmessage = (ev) => { try { render(JSON.parse(ev.data)); } catch (e) { console.error(e); } };
+    ws.onclose = () => {
+      connIndicator.textContent = "reconnecting…";
+      setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+    ws.onerror = () => ws.close();
+  }
+  connect();
+
+  // Redraw chart on resize so it stays crisp.
+  window.addEventListener("resize", () => drawChart(currentWindow ? currentWindow.s0 : null));
+
+  // Initial state via REST in case the WS takes a moment.
+  fetch("/api/state").then((r) => r.json()).then(render).catch(() => {});
+
+  // ---------- tabs ----------
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".tab-page").forEach((p) => p.classList.remove("active"));
+      btn.classList.add("active");
+      document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+      if (btn.dataset.tab === "learning") loadLearning();
+    });
+  });
+
+  // ---------- version badge + drift banner (Live tab) ----------
+  async function pollVersionStatus() {
+    try {
+      const r = await fetch("/api/version_status");
+      const data = await r.json();
+      const badge = document.getElementById("version-badge");
+      if (data.current_version) {
+        badge.hidden = false;
+        badge.textContent = "config " + data.current_version.version_hash.slice(0, 8);
+      } else {
+        badge.hidden = true;
+      }
+      const banner = document.getElementById("drift-banner");
+      if (data.drift && data.drift.has_drift) {
+        banner.hidden = false;
+        banner.textContent = "⚠ Drift detected: " + data.drift.degraded_metrics.join("; ") +
+          " — " + data.drift.suggestion;
+      } else {
+        banner.hidden = true;
+      }
+    } catch (e) { /* best-effort; the live path never depends on this */ }
+  }
+  pollVersionStatus();
+  setInterval(pollVersionStatus, 30000);
+
+  // ---------- Review tab ----------
+  document.getElementById("review-load").addEventListener("click", async () => {
+    const start = document.getElementById("review-start").value;
+    const end = document.getElementById("review-end").value;
+    const params = new URLSearchParams();
+    if (start) params.set("start", start + "T00:00:00+00:00");
+    if (end) params.set("end", end + "T23:59:59+00:00");
+    const reportEl = document.getElementById("review-report");
+    reportEl.textContent = "Loading…";
+    try {
+      const r = await fetch("/api/review?" + params.toString());
+      const data = await r.json();
+      reportEl.textContent = data.report;
+    } catch (e) {
+      reportEl.textContent = "Failed to load review data.";
+    }
+  });
+
+  // ---------- Learning tab ----------
+  function fmtParams(p) {
+    return Object.entries(p).map(([k, v]) => `${k}=${v}`).join(", ");
+  }
+
+  async function loadLearning() {
+    const driftEl = document.getElementById("learning-drift");
+    const patternsEl = document.getElementById("learning-patterns");
+    const proposalsEl = document.getElementById("learning-proposals");
+    const versionsEl = document.getElementById("learning-versions");
+    try {
+      const r = await fetch("/api/learning");
+      const data = await r.json();
+
+      if (data.drift) {
+        driftEl.innerHTML = data.drift.has_drift
+          ? `⚠ ${data.drift.degraded_metrics.join("; ")}<br>Suggestion: ${data.drift.suggestion}`
+          : "No drift detected.";
+      } else {
+        driftEl.textContent = "No drift check has run yet.";
+      }
+
+      if (data.patterns.length === 0) {
+        patternsEl.textContent = "No significant patterns yet — run `learn` first.";
+      } else {
+        let rows = data.patterns.map((p) => `
+          <tr>
+            <td>${p.dimension}</td><td>${p.bucket}</td><td>${p.n}</td>
+            <td>${fmtMoney(p.mean_pnl)}</td>
+            <td>[${fmtMoney(p.ci_low)}, ${fmtMoney(p.ci_high)}]</td>
+            <td>${p.p_value.toFixed(4)}</td>
+          </tr>`).join("");
+        patternsEl.innerHTML = `<table class="learn-table">
+          <thead><tr><th>Dimension</th><th>Bucket</th><th>N</th><th>Mean P&amp;L</th><th>95% CI</th><th>p</th></tr></thead>
+          <tbody>${rows}</tbody></table>`;
+      }
+
+      if (data.proposals.length === 0) {
+        proposalsEl.textContent = "No proposals yet.";
+      } else {
+        proposalsEl.innerHTML = data.proposals.map((p) => `
+          <div class="proposal-card" data-id="${p.id}">
+            <div class="rationale">${p.rationale} <span class="badge ${p.status}">${p.status}</span></div>
+            <div class="meta">
+              ${fmtParams(p.param_changes)} · n=${p.n_holdout_trades} ·
+              Δ ${fmtMoney(p.holdout_pnl_delta)}
+              [${fmtMoney(p.holdout_pnl_delta_ci_low)}, ${fmtMoney(p.holdout_pnl_delta_ci_high)}] ·
+              drawdown Δ ${fmtMoney(p.holdout_drawdown_delta)}
+            </div>
+            ${p.status === "pending" ? '<button class="promote-btn primary">Promote</button>' : ""}
+            <div class="result"></div>
+          </div>`).join("");
+        proposalsEl.querySelectorAll(".promote-btn").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const card = btn.closest(".proposal-card");
+            const resultEl = card.querySelector(".result");
+            btn.disabled = true;
+            try {
+              const r = await fetch("/api/learning/promote", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ proposal_id: card.dataset.id }),
+              });
+              const outcome = await r.json();
+              resultEl.textContent = outcome.passed
+                ? "Promoted. Apply to config.yaml: " + fmtParams(outcome.promoted_params)
+                : "Rejected: " + (outcome.reasons || []).join("; ");
+              loadLearning();
+            } catch (e) {
+              resultEl.textContent = "Request failed.";
+              btn.disabled = false;
+            }
+          });
+        });
+      }
+
+      if (data.versions.length === 0) {
+        versionsEl.textContent = "No config versions promoted yet.";
+      } else {
+        versionsEl.innerHTML = `<table class="learn-table">
+          <thead><tr><th>Version</th><th>Params</th><th>Created</th><th>Active</th></tr></thead>
+          <tbody>${data.versions.map((v) => `
+            <tr>
+              <td>${v.version_hash.slice(0, 8)}</td>
+              <td>${fmtParams(v.param_changes)}</td>
+              <td>${new Date(v.created_at).toLocaleString()}</td>
+              <td>${v.promoted ? "✓" : ""}</td>
+            </tr>`).join("")}</tbody></table>`;
+      }
+    } catch (e) {
+      driftEl.textContent = "Failed to load learning data.";
+    }
+  }
+
+  document.getElementById("learning-refresh").addEventListener("click", loadLearning);
+  document.getElementById("learning-rollback").addEventListener("click", async () => {
+    try {
+      const r = await fetch("/api/learning/rollback", { method: "POST" });
+      const data = await r.json();
+      alert(data.restored_params ? "Rolled back to: " + fmtParams(data.restored_params) : (data.error || "Nothing to roll back."));
+      loadLearning();
+    } catch (e) { alert("Request failed."); }
+  });
+})();
+</script>
+</body>
+</html>

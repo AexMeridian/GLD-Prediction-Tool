@@ -1,0 +1,14 @@
+.env
+secrets/
+*.pem
+*.key
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+data/*.sqlite
+data/parquet/
+*.egg-info/
