@@ -74,11 +74,21 @@ class PythFeedClient:
         api_key: str,
         feed_id: str,
         max_backoff_s: float = 30.0,
+        idle_timeout_s: float = 60.0,
     ) -> None:
         self._hermes_base = hermes_base.rstrip("/")
         self._api_key = api_key
         self._feed_id = feed_id
         self._max_backoff_s = max_backoff_s
+        # An SSE connection has no protocol-level keepalive (unlike
+        # WebSocket's ping/pong -- see kalshi_ws.py/gold_proxy.py, which
+        # get this for free from the `websockets` library). A silently
+        # dead TCP connection (no FIN/RST -- common after a NAT timeout or
+        # a long idle stretch) leaves `timeout=None` waiting forever with
+        # no exception ever raised, so reconnect-with-backoff never fires.
+        # This bounds how long we'll wait for the NEXT message before
+        # treating the connection as dead and reconnecting.
+        self._idle_timeout_s = idle_timeout_s
         self.last_receive_time: datetime | None = None
 
     def is_stale(self, now: datetime, stale_s: float) -> bool:
@@ -99,7 +109,14 @@ class PythFeedClient:
                     ) as response:
                         response.raise_for_status()
                         backoff = 1.0
-                        async for line in response.aiter_lines():
+                        lines = response.aiter_lines()
+                        while True:
+                            try:
+                                line = await asyncio.wait_for(
+                                    lines.__anext__(), timeout=self._idle_timeout_s
+                                )
+                            except StopAsyncIteration:
+                                break
                             tick = self._parse_line(line)
                             if tick is not None:
                                 self.last_receive_time = tick.receive_time

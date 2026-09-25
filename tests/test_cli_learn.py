@@ -15,6 +15,7 @@ from gold_edge.config import (
     BacktestConfig,
     EngineConfig,
     FeesConfig,
+    GoldProxyConfig,
     KalshiConfig,
     LearningConfig,
     ModelConfig,
@@ -34,6 +35,9 @@ def make_settings(sqlite_path, persist_s: float = 1.5) -> Settings:
         kalshi=KalshiConfig(rest_base="x", ws_url="x", series_ticker="KXGOLD15M"),
         pyth=PythConfig(
             hermes_base="x", price_feed_symbol="x", price_feed_id="x", price_feed_query="x"
+        ),
+        gold_proxy=GoldProxyConfig(
+            ws_url="x", product_id="x", basis_half_life_s=300.0, basis_max_pair_age_s=30.0
         ),
         fees=FeesConfig(base_rate=0.07, fee_multiplier=1.0, maker_fees_enabled=True),
         volatility=VolatilityConfig(

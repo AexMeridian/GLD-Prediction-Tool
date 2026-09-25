@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS ticks (
     conf REAL NOT NULL,
     expo INTEGER NOT NULL,
     publish_time TEXT NOT NULL,
-    receive_time TEXT NOT NULL
+    receive_time TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'pyth_xau'
 );
 
 CREATE TABLE IF NOT EXISTS book_snapshots (
@@ -224,7 +225,18 @@ class Recorder:
         self._conn = sqlite3.connect(sqlite_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Column additions to tables that pre-date them, for databases
+        created before that column existed. New tables need no migration
+        (CREATE TABLE IF NOT EXISTS already handles those)."""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(ticks)")}
+        if "source" not in columns:
+            self._conn.execute(
+                "ALTER TABLE ticks ADD COLUMN source TEXT NOT NULL DEFAULT 'pyth_xau'"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -234,8 +246,8 @@ class Recorder:
 
     def _insert_tick(self, tick: Tick) -> None:
         self._conn.execute(
-            "INSERT INTO ticks (symbol, price, conf, expo, publish_time, receive_time) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ticks (symbol, price, conf, expo, publish_time, receive_time, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 tick.symbol,
                 tick.price,
@@ -243,6 +255,7 @@ class Recorder:
                 tick.expo,
                 tick.publish_time.isoformat(),
                 tick.receive_time.isoformat(),
+                tick.source,
             ),
         )
         self._conn.commit()

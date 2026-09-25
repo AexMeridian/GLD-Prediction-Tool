@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import random
 from bisect import bisect_left
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -71,6 +72,7 @@ from gold_edge.learning.patterns import (
     build_round_trip_features,
 )
 from gold_edge.learning.proposer import Proposal, propose_threshold_changes
+from gold_edge.learning.registry import RejectedProposal, is_in_reproposal_cooldown
 from gold_edge.models import Tick
 
 # Bounded, per CLAUDE.md's "keep search grids small and bounded to sane
@@ -149,6 +151,7 @@ def run_learning_pipeline(
     fill_latency_samples: list[FillLatencySample],
     macro_events: list[MacroEvent] | None = None,
     proposer_param_grid: dict[str, list[float]] | None = None,
+    rejected_proposals: Sequence[RejectedProposal] = (),
     seed: int | None = None,
 ) -> LearningPipelineResult:
     macro_events = macro_events or []
@@ -337,7 +340,7 @@ def run_learning_pipeline(
             train_ticks = [t for t in ticks if t.receive_time <= train_end]
             test_ticks = [t for t in ticks if t.receive_time > train_end]
             if test_ticks:
-                proposals = propose_threshold_changes(
+                candidate_proposals = propose_threshold_changes(
                     train_ticks,
                     train_windows,
                     test_ticks,
@@ -350,6 +353,18 @@ def run_learning_pipeline(
                     proposer_param_grid,
                     seed=seed,
                 )
+                # Anti-overfitting, per CLAUDE.md: "if a proposal was
+                # rejected, don't re-propose near-identical params within N
+                # days." `as_of` is the last real data point this pipeline
+                # saw, not wall-clock time, so a run stays a pure function
+                # of its inputs (replayable, testable) rather than depending
+                # on when it happened to execute.
+                as_of = test_windows[-1].window.close_time
+                proposals = [
+                    p
+                    for p in candidate_proposals
+                    if not is_in_reproposal_cooldown(p.param_changes, rejected_proposals, as_of)
+                ]
 
     return LearningPipelineResult(
         markouts=markouts,

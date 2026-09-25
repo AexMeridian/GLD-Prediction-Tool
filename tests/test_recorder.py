@@ -4,9 +4,76 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from gold_edge.learning.markouts import Markout
+from gold_edge.models import Tick
 from gold_edge.recorder import Recorder
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def test_record_tick_defaults_source_to_pyth_xau(tmp_path):
+    sqlite_path = tmp_path / "test.sqlite"
+    recorder = Recorder(sqlite_path)
+    tick = Tick(symbol="x", price=4380.0, conf=0.1, expo=0, publish_time=T0, receive_time=T0)
+    asyncio.run(recorder.record_tick(tick))
+    recorder.close()
+
+    conn = sqlite3.connect(sqlite_path)
+    row = conn.execute("SELECT price, source FROM ticks").fetchone()
+    conn.close()
+    assert row == (4380.0, "pyth_xau")
+
+
+def test_record_tick_preserves_proxy_source(tmp_path):
+    sqlite_path = tmp_path / "test.sqlite"
+    recorder = Recorder(sqlite_path)
+    tick = Tick(
+        symbol="PAXG-USD",
+        price=4375.0,
+        conf=0.5,
+        expo=0,
+        publish_time=T0,
+        receive_time=T0,
+        source="paxg_proxy",
+    )
+    asyncio.run(recorder.record_tick(tick))
+    recorder.close()
+
+    conn = sqlite3.connect(sqlite_path)
+    row = conn.execute("SELECT source FROM ticks").fetchone()
+    conn.close()
+    assert row == ("paxg_proxy",)
+
+
+def test_migrates_pre_existing_ticks_table_missing_source_column(tmp_path):
+    """A database created before the `source` column existed shouldn't
+    crash Recorder.__init__ or lose its ability to insert new ticks."""
+    sqlite_path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(sqlite_path)
+    conn.executescript(
+        """
+        CREATE TABLE ticks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            price REAL NOT NULL,
+            conf REAL NOT NULL,
+            expo INTEGER NOT NULL,
+            publish_time TEXT NOT NULL,
+            receive_time TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    recorder = Recorder(sqlite_path)
+    tick = Tick(symbol="x", price=1.0, conf=0.0, expo=0, publish_time=T0, receive_time=T0)
+    asyncio.run(recorder.record_tick(tick))
+    recorder.close()
+
+    conn = sqlite3.connect(sqlite_path)
+    row = conn.execute("SELECT source FROM ticks").fetchone()
+    conn.close()
+    assert row == ("pyth_xau",)
 
 
 def test_record_markout_round_trips_through_sqlite(tmp_path):

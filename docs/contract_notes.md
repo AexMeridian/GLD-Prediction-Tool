@@ -101,6 +101,35 @@ near XAU/USD's daily halt.
   `KALSHI_PRIVATE_KEY_PATH`. `feeds/pyth.py` must send the bearer header on
   both REST and SSE calls.
 
+**Correction (2026-09-18) — the closure is weekly, not a ~1hr daily halt.**
+Live recording caught `Metal.XAU/USD` frozen for 3+ hours straight (same
+price, same `publish_time`, both the SSE stream and the REST `/latest`
+endpoint) starting Friday ~17:00 ET and still closed as of Friday 19:58 ET.
+Fetching `/v2/price_feeds?query=XAU` mid-freeze shows why — the feed's
+`schedule` field (`America/New_York;0000-1700&1800-2400,...,0000-1700,C,
+1800-2400`) gives Friday as `0000-1700` (no evening reopen) and Saturday as
+`C` (fully closed all day); `market_hours.next_open` resolves to Sunday
+~18:00 ET. So the real gap is **Friday ~17:00 ET through Sunday ~18:00 ET —
+essentially the whole weekend**, not a short daily dip. Since Kalshi's
+KXGOLD15M now trades weekends (see the 2026-09-17 update above), this is
+the single biggest hole in the free-tier setup, bigger than originally
+scoped here.
+- **Mitigation shipped 2026-09-18:** `feeds/gold_proxy.py` streams PAXG
+  (tokenized, physically-redeemable gold) from Coinbase's free, keyless
+  public WebSocket as a 24/7 fallback, basis-corrected against real Pyth
+  spot via `model/basis.py` whenever both are live. `live` mode
+  (`server.py`) switches to it automatically once `Metal.XAU/USD` is
+  confirmed stale/closed; `record` captures both streams continuously,
+  tagged by source, so recorded data is never ambiguous about which one
+  produced a given tick. This does not close the accuracy gap versus the
+  paid `pyth-indices` entitlement Kalshi actually settles on — PAXG is a
+  correlated proxy, not the settlement source — but it's a real
+  improvement over having zero live price for ~49 hours a week.
+- Both `Crypto.PAXG/USD` and `Crypto.XAUT/USD` were checked directly against
+  this Pyth account and returned `"Not entitled... asset type 'crypto'"` —
+  the free plan doesn't grant Pyth's own crypto feeds either, which is why
+  the fallback goes to Coinbase/Kraken's exchange APIs directly instead.
+
 ## Kalshi Trade API v2 (confirmed live)
 
 - **REST base (production, confirmed working via direct request):**

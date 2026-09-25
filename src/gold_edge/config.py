@@ -27,6 +27,13 @@ class PythConfig(BaseModel):
     price_feed_query: str
 
 
+class GoldProxyConfig(BaseModel):
+    ws_url: str
+    product_id: str
+    basis_half_life_s: float
+    basis_max_pair_age_s: float
+
+
 class FeesConfig(BaseModel):
     base_rate: float
     fee_multiplier: float
@@ -94,6 +101,7 @@ class Settings(BaseSettings):
 
     kalshi: KalshiConfig
     pyth: PythConfig
+    gold_proxy: GoldProxyConfig
     fees: FeesConfig
     volatility: VolatilityConfig
     model: ModelConfig

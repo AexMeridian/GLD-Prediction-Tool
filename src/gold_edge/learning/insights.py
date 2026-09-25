@@ -140,6 +140,12 @@ def weekly_report(
             f"  Not yet learned ({delay_profile.n} fills recorded; needs 50) -- "
             "using the configured default delay range."
         )
+    if delay_profile.miss_rate_by_reason:
+        lines.append("  Miss rate by signal type (expired or explicitly skipped):")
+        for reason, rate in sorted(
+            delay_profile.miss_rate_by_reason.items(), key=lambda kv: kv[1], reverse=True
+        ):
+            lines.append(f"    {reason}: {rate:.0%}")
     lines.append("")
 
     lines.append(f"Pending proposals: {len(pending_proposals)}")

@@ -28,6 +28,7 @@ from pydantic import BaseModel
 
 from gold_edge.config import FeesConfig, Settings
 from gold_edge.engine.state_machine import EngineState, MarketSnapshot, apply_fill, apply_skip, step
+from gold_edge.feeds.gold_proxy import ProxyFeedClient
 from gold_edge.feeds.kalshi_auth import KalshiSigner
 from gold_edge.feeds.kalshi_rest import KalshiRestClient
 from gold_edge.feeds.kalshi_ws import KalshiWsClient
@@ -43,6 +44,7 @@ from gold_edge.learning.queries import (
     load_session_data,
 )
 from gold_edge.model import fees as fees_mod
+from gold_edge.model.basis import BasisTracker
 from gold_edge.model.fair_value import FairValue, compute_fair_value
 from gold_edge.model.fees import settle_position_pnl
 from gold_edge.model.volatility import VolatilityTracker
@@ -150,6 +152,7 @@ def _build_state_payload(
     session_log_tail: list[dict[str, Any]],
     settlement_source_ok: bool | None = None,
     pyth_market_open: bool | None = None,
+    price_source: str | None = None,
 ) -> dict[str, Any]:
     pyth_stale = pyth_age_s is None or pyth_age_s > stale_s
     kalshi_stale = kalshi_age_s is None or kalshi_age_s > stale_s
@@ -172,6 +175,7 @@ def _build_state_payload(
             "kalshi_stale": kalshi_stale,
             "settlement_source_ok": settlement_source_ok,
             "pyth_market_open": pyth_market_open,
+            "price_source": price_source,
         },
         "session": {
             "round_trips": engine_state.round_trips,
@@ -303,8 +307,10 @@ class AppState:
     pyth_api_key: str
 
     window: Window | None = None
-    latest_price: float | None = None
+    pyth_latest_price: float | None = None
     pyth_receive_time: datetime | None = None
+    proxy_latest_price: float | None = None
+    proxy_receive_time: datetime | None = None
     book: BookSnapshot | None = None
     kalshi_receive_time: datetime | None = None
     fair: FairValue | None = None
@@ -326,6 +332,7 @@ class AppState:
     pyth_market_open: bool | None = None
 
     vol_tracker: VolatilityTracker | None = None
+    basis_tracker: BasisTracker | None = None
     recorder: Recorder | None = None
     rest_client: KalshiRestClient | None = None
 
@@ -343,26 +350,61 @@ class AppState:
         if len(self.session_log) > SESSION_LOG_MAX:
             self.session_log = self.session_log[-SESSION_LOG_MAX:]
 
-    def pyth_age_s(self, now: datetime) -> float | None:
-        """Effective staleness of the Pyth price for both the dashboard and
-        the engine — a confirmed-closed underlying market (e.g. XAU/USD's
-        daily halt) counts as stale even if messages keep arriving, since a
-        receive-time gap alone can't detect a frozen/heartbeat price."""
-        age = (now - self.pyth_receive_time).total_seconds() if self.pyth_receive_time else None
-        if self.pyth_market_open is False:
-            floor = self.settings.engine.stale_s + 1.0
-            age = floor if age is None else max(age, floor)
-        return age
+    def effective_price_age_source(
+        self, now: datetime
+    ) -> tuple[float | None, float | None, str | None]:
+        """Resolves (price, age_s, source) from whichever feed is actually
+        usable right now -- this is the one place that decides Pyth XAU/USD
+        vs. the PAXG proxy vs. "nothing usable", so the engine, the payload,
+        and the vol tracker never disagree about which price is live.
+
+        A confirmed-closed underlying market (e.g. XAU/USD's daily halt)
+        disqualifies Pyth even if messages keep arriving, since a
+        receive-time gap alone can't detect a frozen/heartbeat price. The
+        proxy is only used once a basis estimate exists (model/basis.py) --
+        never trusted raw."""
+        stale_s = self.settings.engine.stale_s
+        pyth_age = (
+            (now - self.pyth_receive_time).total_seconds() if self.pyth_receive_time else None
+        )
+        pyth_usable = (
+            self.pyth_latest_price is not None
+            and pyth_age is not None
+            and pyth_age <= stale_s
+            and self.pyth_market_open is not False
+        )
+        if pyth_usable:
+            return self.pyth_latest_price, pyth_age, "pyth_xau"
+
+        proxy_age = (
+            (now - self.proxy_receive_time).total_seconds() if self.proxy_receive_time else None
+        )
+        if (
+            self.proxy_latest_price is not None
+            and proxy_age is not None
+            and proxy_age <= stale_s
+            and self.basis_tracker is not None
+        ):
+            estimated = self.basis_tracker.estimate_spot(self.proxy_latest_price)
+            if estimated is not None:
+                return estimated, proxy_age, "paxg_proxy"
+
+        # Neither source is usable -- report the last known Pyth price (if
+        # any) so the dashboard still shows something, but force staleness
+        # past the threshold so the engine never trades on it.
+        floor = stale_s + 1.0
+        fallback_age = floor if pyth_age is None else max(pyth_age, floor)
+        return self.pyth_latest_price, fallback_age, None
 
     def payload(self) -> dict[str, Any]:
         now = datetime.now(UTC)
-        pyth_age_s = self.pyth_age_s(now)
+        price, pyth_age_s, price_source = self.effective_price_age_source(now)
         kalshi_age_s = (
             (now - self.kalshi_receive_time).total_seconds() if self.kalshi_receive_time else None
         )
         return _build_state_payload(
             window=self.window,
-            latest_price=self.latest_price,
+            latest_price=price,
             book=self.book,
             fair=self.fair,
             engine_state=self.engine_state,
@@ -373,6 +415,7 @@ class AppState:
             kill_switch=self.kill_switch,
             session_log_tail=self.session_log[-SESSION_LOG_SENT_TO_CLIENT:],
             settlement_source_ok=self.settlement_source_ok,
+            price_source=price_source,
             pyth_market_open=self.pyth_market_open,
         )
 
@@ -389,19 +432,19 @@ class AppState:
 
 
 async def _recompute_and_step(app: AppState) -> None:
-    if app.window is None or app.window.s0 is None or app.latest_price is None or app.book is None:
+    now = datetime.now(UTC)
+    effective_price, _price_age, _price_source = app.effective_price_age_source(now)
+    if app.window is None or app.window.s0 is None or effective_price is None or app.book is None:
         await app.broadcast()
         return
 
-    now = datetime.now(UTC)
-    _pyth_age = app.pyth_age_s(now)
-    pyth_age_s = _pyth_age if _pyth_age is not None else 999.0
+    pyth_age_s = _price_age if _price_age is not None else 999.0
     kalshi_age_s = (
         (now - app.kalshi_receive_time).total_seconds() if app.kalshi_receive_time else 999.0
     )
     tau_minutes = app.window.seconds_left(now) / 60.0
     app.fair = compute_fair_value(
-        app.latest_price,
+        effective_price,
         float(app.window.s0),
         app.vol_tracker.sigma_per_minute,
         tau_minutes,
@@ -422,7 +465,7 @@ async def _recompute_and_step(app: AppState) -> None:
             pyth_age_s=pyth_age_s,
             kalshi_age_s=kalshi_age_s,
             short_horizon_sigma_per_minute=app.vol_tracker.short_horizon_sigma_per_minute,
-            underlying_price=app.latest_price,
+            underlying_price=effective_price,
         )
         result = step(
             app.engine_state,
@@ -454,12 +497,49 @@ async def _pyth_loop(app: AppState) -> None:
         app.settings.pyth.hermes_base, app.pyth_api_key, app.settings.pyth.price_feed_id
     )
     async for tick in client.ticks():
-        app.latest_price = tick.price
+        app.pyth_latest_price = tick.price
         app.pyth_receive_time = tick.receive_time
         if app.vol_tracker is not None:
             app.vol_tracker.update(tick.price, tick.publish_time)
         if app.recorder is not None:
             await app.recorder.record_tick(tick)
+        if (
+            app.basis_tracker is not None
+            and app.proxy_latest_price is not None
+            and app.proxy_receive_time is not None
+        ):
+            app.basis_tracker.update(
+                tick.price, app.proxy_latest_price, tick.receive_time, app.proxy_receive_time
+            )
+        await _recompute_and_step(app)
+
+
+async def _proxy_loop(app: AppState) -> None:
+    """24/7 fallback price for exactly the gap the free Pyth plan can't
+    cover -- see feeds/gold_proxy.py. Always running (not just once Pyth
+    goes stale) so the basis estimate in model/basis.py stays current the
+    whole time both feeds are live, not just recomputed cold at the
+    moment it's first needed."""
+    client = ProxyFeedClient(app.settings.gold_proxy.ws_url, app.settings.gold_proxy.product_id)
+    async for tick in client.ticks():
+        app.proxy_latest_price = tick.price
+        app.proxy_receive_time = tick.receive_time
+        if app.recorder is not None:
+            await app.recorder.record_tick(tick)
+        if (
+            app.basis_tracker is not None
+            and app.pyth_latest_price is not None
+            and app.pyth_receive_time is not None
+        ):
+            app.basis_tracker.update(
+                app.pyth_latest_price, tick.price, app.pyth_receive_time, tick.receive_time
+            )
+        now = datetime.now(UTC)
+        _price, _age, active_source = app.effective_price_age_source(now)
+        if active_source == "paxg_proxy" and app.vol_tracker is not None and app.basis_tracker:
+            estimated = app.basis_tracker.estimate_spot(tick.price)
+            if estimated is not None:
+                app.vol_tracker.update(estimated, tick.publish_time)
         await _recompute_and_step(app)
 
 
@@ -666,7 +746,31 @@ class PromoteRequest(BaseModel):
     proposal_id: str
 
 
+def _settings_with_promoted_config(settings: Settings, sqlite_path: Path) -> Settings:
+    """Applies the latest promoted `config_versions` row (if any) on top of
+    the EngineConfig loaded from config.yaml.
+
+    `learning/actions.py`'s `promote_proposal` only ever persists the new
+    version to SQLite -- CLAUDE.md's "no change mid-session" means a
+    promotion must never mutate a *running* session's config. This is
+    where that promise is actually kept on the other side: read once, here,
+    at process startup, so a promotion approved yesterday is live the next
+    time `live` starts, rather than silently recorded and never applied."""
+    if not sqlite_path.exists():
+        return settings
+    promoted = [v for v in load_config_versions(sqlite_path) if v.promoted]
+    if not promoted:
+        return settings
+    latest = promoted[-1]
+    logger.info(
+        "Applying promoted config version %s: %s", latest.version_hash, latest.param_changes
+    )
+    updated_engine = settings.engine.model_copy(update=latest.param_changes)
+    return settings.model_copy(update={"engine": updated_engine})
+
+
 def create_app(settings: Settings, signer: KalshiSigner, pyth_api_key: str) -> FastAPI:
+    settings = _settings_with_promoted_config(settings, settings.sqlite_path)
     app_state = AppState(settings=settings, signer=signer, pyth_api_key=pyth_api_key)
 
     async def lifespan(_: FastAPI):
@@ -677,9 +781,14 @@ def create_app(settings: Settings, signer: KalshiSigner, pyth_api_key: str) -> F
             short_horizon_s=settings.volatility.short_horizon_s,
             min_sigma_per_minute=settings.volatility.min_sigma_per_minute,
         )
+        app_state.basis_tracker = BasisTracker(
+            half_life_s=settings.gold_proxy.basis_half_life_s,
+            max_pair_age_s=settings.gold_proxy.basis_max_pair_age_s,
+        )
         tasks = [
             asyncio.create_task(_window_rollover_loop(app_state)),
             asyncio.create_task(_pyth_loop(app_state)),
+            asyncio.create_task(_proxy_loop(app_state)),
             asyncio.create_task(_ticker_loop(app_state)),
             asyncio.create_task(_pyth_market_hours_loop(app_state)),
         ]

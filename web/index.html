@@ -260,7 +260,10 @@
       ⚠ Live price feed may not exactly match Kalshi's settlement source (see docs/contract_notes.md)
     </span>
     <span id="market-closed-warning" hidden style="color:var(--danger);">
-      ⚠ Underlying gold market is currently closed (daily feed pause) — price is not trustworthy right now
+      ⚠ No trustworthy live price available right now (feed closed/stale and proxy unavailable)
+    </span>
+    <span id="proxy-active-notice" hidden style="color:var(--warn);">
+      ⓘ Spot gold feed is closed — using PAXG-based proxy price (approximate, not exact settlement source)
     </span>
   </div>
 </div>
@@ -539,7 +542,8 @@
     document.getElementById("pyth-age").textContent = fs.pyth_age_s != null ? fs.pyth_age_s.toFixed(1) + "s" : "—";
     document.getElementById("kalshi-age").textContent = fs.kalshi_age_s != null ? fs.kalshi_age_s.toFixed(1) + "s" : "—";
     document.getElementById("settlement-source-warning").hidden = fs.settlement_source_ok !== false;
-    document.getElementById("market-closed-warning").hidden = fs.pyth_market_open !== false;
+    document.getElementById("market-closed-warning").hidden = fs.price_source != null || !fs.pyth_stale;
+    document.getElementById("proxy-active-notice").hidden = fs.price_source !== "paxg_proxy";
     const session = state.session || {};
     document.getElementById("round-trips").textContent = session.round_trips ?? 0;
     const pnlEl = document.getElementById("realized-pnl");

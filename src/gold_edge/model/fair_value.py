@@ -18,8 +18,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from scipy.stats import norm
-
 
 @dataclass(frozen=True)
 class FairValue:
@@ -43,7 +41,9 @@ def compute_fair_value(
         raw_yes = 1.0 if s >= s0 else 0.0
     else:
         z = math.log(s / s0) / denom
-        raw_yes = float(norm.cdf(z))
+        # Scalar normal CDF via erf: identical to scipy's norm.cdf but ~100x
+        # faster, which matters because replay/sweeps call this per book update.
+        raw_yes = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
     yes = min(max(raw_yes, min_fair_value), max_fair_value)
     return FairValue(yes=yes, no=1.0 - yes)

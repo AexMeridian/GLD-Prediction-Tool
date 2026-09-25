@@ -4,6 +4,7 @@ from decimal import Decimal
 from gold_edge.backtest.replay import RecordedWindow
 from gold_edge.learning.delay_profile import FillLatencySample
 from gold_edge.learning.pipeline import run_learning_pipeline
+from gold_edge.learning.registry import RejectedProposal
 from gold_edge.models import Tick, Window
 from tests.test_backtest_replay import bt_cfg, model_cfg, vol_cfg
 from tests.test_learning_grader import learning_cfg
@@ -136,6 +137,36 @@ class TestRunLearningPipeline:
         )
         assert result.delay_profile.is_learned is True
         assert result.delay_profile.n == 60
+
+    def test_recently_rejected_near_identical_proposal_is_not_re_proposed(self):
+        """Anti-overfitting, per CLAUDE.md: a rejected proposal shouldn't
+        reappear with near-identical params within the cooldown window."""
+        windows = [strong_edge_window(f"KXGOLD15M-P{d}", day_offset=d) for d in range(3)]
+        ticks = [t for d in range(3) for t in strong_edge_ticks(day_offset=d)]
+        as_of = windows[-1].window.close_time
+        rejected = [
+            RejectedProposal(
+                param_changes={"entry_cutoff_s": 30.0},
+                rejected_at=as_of - timedelta(days=1),
+                reasons=["did not beat live config in shadow mode"],
+            )
+        ]
+
+        result = run_learning_pipeline(
+            ticks=ticks,
+            windows=windows,
+            engine_cfg=engine_cfg(entry_cutoff_s=90.0),
+            fees_cfg=fees_cfg(),
+            vol_cfg=vol_cfg(),
+            model_cfg=model_cfg(),
+            backtest_cfg=bt_cfg(human_delay_min_s=1.0, human_delay_max_s=1.0),
+            learning_cfg=learning_cfg(),
+            fill_latency_samples=[],
+            proposer_param_grid={"entry_cutoff_s": [90.0, 30.0]},
+            rejected_proposals=rejected,
+            seed=0,
+        )
+        assert not any(p.param_changes.get("entry_cutoff_s") == 30.0 for p in result.proposals)
 
     def test_no_proposals_with_too_few_windows(self):
         windows = [strong_edge_window("KXGOLD15M-P0")]

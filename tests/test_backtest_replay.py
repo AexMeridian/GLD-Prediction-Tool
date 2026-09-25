@@ -346,6 +346,35 @@ class TestLoadRecordedData:
         assert windows[0].settlement_result == "yes"
         assert len(windows[0].books) == 1
 
+    def test_excludes_proxy_ticks_by_default(self, tmp_path):
+        """Replay must never silently blend un-basis-adjusted paxg_proxy
+        ticks into the same series as real spot -- see the tick_source note
+        on load_recorded_data. Only the live path (server.py) knows how to
+        reconcile the two."""
+        sqlite_path = tmp_path / "test.sqlite"
+        recorder = Recorder(sqlite_path)
+        real = tick(2000.0, T0)
+        proxy = Tick(
+            symbol="PAXG-USD",
+            price=1995.0,
+            conf=0.5,
+            expo=0,
+            publish_time=T0,
+            receive_time=T0,
+            source="paxg_proxy",
+        )
+
+        import asyncio
+
+        asyncio.run(recorder.record_tick(real))
+        asyncio.run(recorder.record_tick(proxy))
+        recorder.close()
+
+        ticks, _ = load_recorded_data(sqlite_path)
+        assert len(ticks) == 1
+        assert ticks[0].source == "pyth_xau"
+        assert ticks[0].price == 2000.0
+
     def test_excludes_windows_without_known_s0(self, tmp_path):
         sqlite_path = tmp_path / "test.sqlite"
         conn = sqlite3.connect(sqlite_path)

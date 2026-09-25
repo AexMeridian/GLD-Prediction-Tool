@@ -107,6 +107,18 @@ class TestWeeklyReport:
         report = weekly_report([], profile, [], None, min_bucket_n=30)
         assert "Learned from 60 fills" in report
 
+    def test_miss_rate_by_reason_reported_when_present(self):
+        profile = DelayProfile(
+            samples=[1.0] * 60, n=60, miss_rate_by_reason={"enter_edge": 0.25, "stop": 0.0}
+        )
+        report = weekly_report([], profile, [], None, min_bucket_n=30)
+        assert "Miss rate by signal type" in report
+        assert "enter_edge: 25%" in report
+
+    def test_no_miss_rate_section_when_empty(self):
+        report = weekly_report([], DelayProfile(), [], None, min_bucket_n=30)
+        assert "Miss rate by signal type" not in report
+
     def test_pending_proposals_listed(self):
         proposal = Proposal(
             id="p1",

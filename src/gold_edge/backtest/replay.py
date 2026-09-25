@@ -352,13 +352,29 @@ def replay_all(
 
 
 def load_recorded_data(
-    sqlite_path: Path, start: datetime | None = None, end: datetime | None = None
+    sqlite_path: Path,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    tick_source: str = "pyth_xau",
 ) -> tuple[list[Tick], list[RecordedWindow]]:
     """Loads everything `replay_all` needs from the recorder's SQLite file:
     every window with a known S0 (unresolved/void windows can't be replayed
     since fair value has no reference price), its book snapshots, its
     settlement result if known, and the full tick stream over the same
-    range (ticks aren't tagged by window — they're one continuous feed)."""
+    range (ticks aren't tagged by window — they're one continuous feed).
+
+    Only `tick_source` ticks are loaded (default: real Pyth spot). The
+    recorder (see feeds/gold_proxy.py) also stores raw `paxg_proxy` ticks
+    continuously, including while Pyth is live -- naively merging both by
+    receive_time here would splice an un-basis-adjusted, several-dollar-off
+    proxy price into the same series as real spot, corrupting volatility
+    and fair-value math for backtest/learn. `server.py`'s live fallback
+    (`AppState.effective_price_age_source`) knows how to reconcile the two
+    with a live-tracked basis; replay has no equivalent history to redo
+    that offline, so for now it only ever backtests/learns from confirmed
+    real spot ticks. Windows recorded only from the proxy (feed closed)
+    simply produce no signals here, same as if there were no data at all --
+    honest silence rather than a fabricated approximation."""
     conn = sqlite3.connect(sqlite_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -411,16 +427,15 @@ def load_recorded_data(
             )
 
         tick_query = "SELECT * FROM ticks"
-        tick_params: list[Any] = []
-        conditions = []
+        conditions = ["source = ?"]
+        tick_params: list[Any] = [tick_source]
         if start is not None:
             conditions.append("receive_time >= ?")
             tick_params.append(start.isoformat())
         if end is not None:
             conditions.append("receive_time <= ?")
             tick_params.append(end.isoformat())
-        if conditions:
-            tick_query += " WHERE " + " AND ".join(conditions)
+        tick_query += " WHERE " + " AND ".join(conditions)
         tick_query += " ORDER BY receive_time"
         ticks = [
             Tick(
@@ -430,6 +445,7 @@ def load_recorded_data(
                 expo=t["expo"],
                 publish_time=datetime.fromisoformat(t["publish_time"]),
                 receive_time=datetime.fromisoformat(t["receive_time"]),
+                source=t["source"],
             )
             for t in conn.execute(tick_query, tick_params).fetchall()
         ]

@@ -11,23 +11,83 @@ import asyncio
 import random
 import sqlite3
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
+
+import httpx
+import numpy as np
 
 from gold_edge.backtest.replay import load_recorded_data, replay_all, run_sweep
 from gold_edge.backtest.report import format_report, format_sweep_report
 from gold_edge.config import Settings, get_settings
+from gold_edge.feeds.gold_proxy import ProxyFeedClient
 from gold_edge.feeds.kalshi_auth import KalshiSigner
 from gold_edge.feeds.kalshi_rest import KalshiRestClient
 from gold_edge.feeds.kalshi_ws import KalshiWsClient
 from gold_edge.feeds.pyth import PythFeedClient
 from gold_edge.learning.actions import promote_proposal, rollback_config
+from gold_edge.learning.blend import fit_blend, format_blend, walk_forward_blend
+from gold_edge.learning.blend_shadow import (
+    BlendArtifact,
+    PriceState,
+    ShadowEngine,
+    ShadowStore,
+    ShadowWindow,
+    make_artifact,
+    parse_market_quote,
+)
 from gold_edge.learning.delay_profile import FillLatencySample
+from gold_edge.learning.feature_blend import (
+    BASE,
+    fit_and_score,
+    paired_diff,
+    split_dev_holdout,
+    walk_forward,
+)
+from gold_edge.learning.historical_gold import (
+    PriceBar,
+    build_calibration_points,
+    evaluate_historical_calibration,
+    fetch_yahoo_chart,
+    fit_gld_session_vol_multipliers,
+    format_historical_report,
+    format_vol_multiplier_report,
+    format_walkforward_report,
+    run_walkforward_rounds,
+    summarize_realized_vol,
+)
+from gold_edge.learning.history import (
+    COINBASE_BASE,
+    KALSHI_BASE,
+    backfill_candles,
+    backfill_paxg,
+    backfill_windows,
+    densify,
+    load_paxg_bars,
+    open_history,
+    parse_coinbase_candles,
+)
+from gold_edge.learning.history import _get as _history_get
 from gold_edge.learning.insights import session_report_card, weekly_report
+from gold_edge.learning.market_study import (
+    BookQuote,
+    GldSeries,
+    WindowRef,
+    _cluster_bootstrap,
+    build_study_rows,
+    compare_brier,
+    format_study,
+    hold_to_settlement,
+    load_gld_cache,
+    proxy_agreement,
+    save_gld_cache,
+)
 from gold_edge.learning.opportunities import filter_scorecard
 from gold_edge.learning.patterns import load_macro_events
 from gold_edge.learning.pipeline import run_learning_pipeline
 from gold_edge.learning.queries import load_proposals, load_session_data
+from gold_edge.learning.registry import RejectedProposal
 from gold_edge.model.fair_value import compute_fair_value
 from gold_edge.model.volatility import VolatilityTracker
 from gold_edge.models import BookSnapshot, Window
@@ -61,6 +121,25 @@ def _require_pyth_key(settings: Settings) -> str:
     return settings.pyth_api_key
 
 
+async def _supervised(name: str, make_loop, max_backoff_s: float = 30.0) -> None:
+    """Keeps a recording loop alive. A bare `create_task` that raises just
+    ends silently, and the rest of `record` keeps running as if nothing
+    happened -- which left days of Kalshi books recorded with no price
+    ticks at all. Any non-cancellation error is logged and the loop is
+    restarted with backoff."""
+    backoff = 1.0
+    while True:
+        try:
+            await make_loop()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a feed task must never die silently
+            print(f"[{name}] recording loop crashed ({exc!r}); restarting in {backoff:.1f}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff_s)
+
+
 async def _pyth_recording_loop(client: PythFeedClient, recorder: Recorder) -> None:
     count = 0
     async for tick in client.ticks():
@@ -68,6 +147,19 @@ async def _pyth_recording_loop(client: PythFeedClient, recorder: Recorder) -> No
         count += 1
         if count % 10 == 0:
             print(f"[pyth]   {tick.publish_time.isoformat()}  price={tick.price:.2f}  (n={count})")
+
+
+async def _proxy_recording_loop(client: ProxyFeedClient, recorder: Recorder) -> None:
+    """Always-on 24/7 fallback recording (see feeds/gold_proxy.py) -- run
+    concurrently with Pyth, not just when Pyth is stale, so `learn` has a
+    continuous proxy series to reconstruct the basis from later, and so the
+    daily halt / weekends aren't a total recording gap."""
+    count = 0
+    async for tick in client.ticks():
+        await recorder.record_tick(tick)
+        count += 1
+        if count % 10 == 0:
+            print(f"[proxy]  {tick.publish_time.isoformat()}  price={tick.price:.2f}  (n={count})")
 
 
 async def _kalshi_recording_loop(
@@ -100,51 +192,68 @@ async def _run_record(settings: Settings) -> None:
         pyth_client = PythFeedClient(
             settings.pyth.hermes_base, pyth_api_key, settings.pyth.price_feed_id
         )
-        pyth_task = asyncio.create_task(_pyth_recording_loop(pyth_client, recorder))
+        pyth_task = asyncio.create_task(
+            _supervised("pyth", lambda: _pyth_recording_loop(pyth_client, recorder))
+        )
+
+        proxy_client = ProxyFeedClient(settings.gold_proxy.ws_url, settings.gold_proxy.product_id)
+        proxy_task = asyncio.create_task(
+            _supervised("proxy", lambda: _proxy_recording_loop(proxy_client, recorder))
+        )
 
         current_window: Window | None = None
         kalshi_task: asyncio.Task | None = None
+        backoff = 1.0
         try:
             while True:
-                window = await get_current_window(rest, settings.kalshi.series_ticker)
-                if window is None:
-                    next_window = await get_next_window(rest, settings.kalshi.series_ticker)
-                    if next_window is None:
-                        print("No open or upcoming KXGOLD15M market found; retrying in 10s")
-                        await asyncio.sleep(10)
+                try:
+                    window = await get_current_window(rest, settings.kalshi.series_ticker)
+                    if window is None:
+                        next_window = await get_next_window(rest, settings.kalshi.series_ticker)
+                        if next_window is None:
+                            print("No open or upcoming KXGOLD15M market found; retrying in 10s")
+                            await asyncio.sleep(10)
+                            continue
+                        wait_s = max(
+                            0.0, (next_window.open_time - datetime.now(UTC)).total_seconds()
+                        )
+                        print(f"Next window {next_window.ticker} opens in {wait_s:.0f}s; waiting")
+                        await asyncio.sleep(min(wait_s + 1, 30))
                         continue
-                    wait_s = max(0.0, (next_window.open_time - datetime.now(UTC)).total_seconds())
-                    print(f"Next window {next_window.ticker} opens in {wait_s:.0f}s; waiting")
-                    await asyncio.sleep(min(wait_s + 1, 30))
-                    continue
 
-                if current_window is None or window.ticker != current_window.ticker:
-                    if current_window is not None:
-                        closed_market = await rest.get_market(current_window.ticker)
-                        await recorder.record_settlement(
-                            current_window.ticker,
-                            closed_market,
-                            closed_market.get("result") or None,
-                            datetime.fromisoformat(
-                                closed_market["settlement_ts"].replace("Z", "+00:00")
+                    if current_window is None or window.ticker != current_window.ticker:
+                        if current_window is not None:
+                            closed_market = await rest.get_market(current_window.ticker)
+                            await recorder.record_settlement(
+                                current_window.ticker,
+                                closed_market,
+                                closed_market.get("result") or None,
+                                datetime.fromisoformat(
+                                    closed_market["settlement_ts"].replace("Z", "+00:00")
+                                )
+                                if closed_market.get("settlement_ts")
+                                else None,
                             )
-                            if closed_market.get("settlement_ts")
-                            else None,
+                            if kalshi_task is not None:
+                                kalshi_task.cancel()
+                        await recorder.record_window(window)
+                        print(f"Window {window.ticker}: S0={window.s0}  close={window.close_time}")
+                        kalshi_task = asyncio.create_task(
+                            _kalshi_recording_loop(
+                                settings.kalshi.ws_url, signer, window.ticker, recorder
+                            )
                         )
-                        if kalshi_task is not None:
-                            kalshi_task.cancel()
-                    await recorder.record_window(window)
-                    print(f"Window {window.ticker}: S0={window.s0}  close={window.close_time}")
-                    kalshi_task = asyncio.create_task(
-                        _kalshi_recording_loop(
-                            settings.kalshi.ws_url, signer, window.ticker, recorder
-                        )
-                    )
-                    current_window = window
+                        current_window = window
 
-                await asyncio.sleep(5)
+                    backoff = 1.0
+                    await asyncio.sleep(5)
+                except Exception as exc:  # noqa: BLE001 - a network hiccup must not kill recording
+                    print(f"Window polling error ({exc}); retrying in {backoff:.1f}s")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
         finally:
             pyth_task.cancel()
+            proxy_task.cancel()
             if kalshi_task is not None:
                 kalshi_task.cancel()
             recorder.close()
@@ -391,13 +500,25 @@ def _run_live(settings: Settings, host: str, port: int) -> None:
 
 def _load_fill_latency_samples(sqlite_path: Path) -> list[FillLatencySample]:
     """CLAUDE.md's delay_profile.py input: real signal-to-fill latency from
-    logged fills, joined against the signal that produced them."""
+    logged fills, joined against the signal that produced them.
+
+    A signal the user never touched at all -- no fill, no explicit skip --
+    only ever gets its `signals.status` updated to EXPIRED (see
+    server.py's finalized-signal handling); it has no row in `fills`. Those
+    are exactly the "missed by pure inaction" signals CLAUDE.md's "learn
+    which signal types the user tends to miss" is asking about, so they're
+    pulled in separately here (no real delay to measure, but they still
+    count toward miss_rate_by_reason)."""
     conn = sqlite3.connect(sqlite_path)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
             "SELECT f.signal_id, f.action, s.reason, f.logged_at, s.created_at, s.status "
             "FROM fills f JOIN signals s ON f.signal_id = s.id WHERE f.signal_id IS NOT NULL"
+        ).fetchall()
+        expired_rows = conn.execute(
+            "SELECT id, action, reason FROM signals WHERE status = 'EXPIRED' "
+            "AND id NOT IN (SELECT signal_id FROM fills WHERE signal_id IS NOT NULL)"
         ).fetchall()
     finally:
         conn.close()
@@ -411,7 +532,20 @@ def _load_fill_latency_samples(sqlite_path: Path) -> list[FillLatencySample]:
         samples.append(
             FillLatencySample(row["signal_id"], row["action"], row["reason"], delay_s, was_missed)
         )
+    for row in expired_rows:
+        samples.append(FillLatencySample(row["id"], row["action"], row["reason"], None, True))
     return samples
+
+
+def _load_rejected_proposals(sqlite_path: Path) -> list[RejectedProposal]:
+    """Feeds registry.is_in_reproposal_cooldown via the pipeline -- CLAUDE.md's
+    anti-overfitting rule needs to know what's already been tried and turned
+    down, not just what's pending now."""
+    return [
+        RejectedProposal(param_changes=p.param_changes, rejected_at=p.created_at, reasons=[])
+        for p, status in load_proposals(sqlite_path)
+        if status == "rejected"
+    ]
 
 
 def _run_learn(settings: Settings, start: str | None, end: str | None, seed: int | None) -> None:
@@ -428,6 +562,7 @@ def _run_learn(settings: Settings, start: str | None, end: str | None, seed: int
 
     fill_samples = _load_fill_latency_samples(settings.sqlite_path)
     macro_events = load_macro_events(settings.sqlite_path.parent / "macro_events.json")
+    rejected_proposals = _load_rejected_proposals(settings.sqlite_path)
 
     print(f"Running learning pipeline over {len(windows)} window(s), {len(ticks)} tick(s)...")
     result = run_learning_pipeline(
@@ -441,6 +576,7 @@ def _run_learn(settings: Settings, start: str | None, end: str | None, seed: int
         learning_cfg=settings.learning,
         fill_latency_samples=fill_samples,
         macro_events=macro_events,
+        rejected_proposals=rejected_proposals,
         seed=seed,
     )
 
@@ -613,6 +749,608 @@ def _run_rollback(settings: Settings) -> None:
         print(f"  {k}: {v}")
 
 
+async def _run_analyze_history(
+    settings: Settings,
+    daily_symbol: str,
+    daily_range: str,
+    intraday_symbol: str,
+    intraday_interval: str,
+    intraday_range: str,
+) -> None:
+    print(
+        f"Fetching {daily_range} of daily history for {daily_symbol} from Yahoo Finance "
+        "(free, keyless)..."
+    )
+    try:
+        daily_bars = await fetch_yahoo_chart(daily_symbol, "1d", daily_range)
+    except httpx.HTTPError as exc:
+        print(f"  fetch failed ({exc}); skipping daily check")
+        daily_bars = []
+    print(f"  got {len(daily_bars)} daily bars")
+    if daily_bars:
+        vol_summary = summarize_realized_vol(daily_bars, settings.learning.min_bucket_n)
+        # A 5-trading-day "window" (Mon open -> Fri close) so there are
+        # interior daily closes (Tue/Wed/Thu) to use as the live "current"
+        # price -- a 1-day window has no interior bar at all with only
+        # daily granularity, which is why this isn't horizon_bars=1. See
+        # build_calibration_points' docstring for why the window's own
+        # close can never be used as "current".
+        points = build_calibration_points(
+            daily_bars,
+            settings.volatility,
+            settings.model,
+            window_bars=5,
+            max_window_minutes=10_080.0,
+            round_by="year",
+        )
+        calibration = evaluate_historical_calibration(points)
+        print()
+        print(
+            format_historical_report(
+                f"{daily_symbol} daily bars, 5-trading-day-window calibration "
+                f"({len(daily_bars)} real trading days)",
+                vol_summary,
+                calibration,
+            )
+        )
+        # Multiple rounds of analysis, one per calendar year, walking
+        # forward: does a calibrator fit on earlier years still help on a
+        # year it has never seen? A single 80/20 split above can't answer
+        # that -- it could just be one lucky split.
+        print()
+        print(
+            format_walkforward_report(
+                f"{daily_symbol} daily, year-by-year", run_walkforward_rounds(points)
+            )
+        )
+
+    print()
+    print(
+        f"Fetching {intraday_range} of {intraday_interval} intraday history for "
+        f"{intraday_symbol} from Yahoo Finance (free, keyless; NYSE hours only)..."
+    )
+    try:
+        intraday_bars = await fetch_yahoo_chart(intraday_symbol, intraday_interval, intraday_range)
+    except httpx.HTTPError as exc:
+        print(f"  fetch failed ({exc}); skipping intraday check")
+        intraday_bars = []
+    print(f"  got {len(intraday_bars)} intraday bars")
+    if intraday_bars:
+        vol_summary = summarize_realized_vol(intraday_bars, settings.learning.min_bucket_n)
+        # 1-minute bars, 15-bar windows == exactly Kalshi's real window
+        # length, with 14 interior "current price" points per window.
+        # max_window_minutes excludes any window whose open-to-close time
+        # jumped across an overnight/weekend close in this NYSE-hours-only
+        # series -- see historical_gold.py's module docstring.
+        points = build_calibration_points(
+            intraday_bars,
+            settings.volatility,
+            settings.model,
+            window_bars=15,
+            max_window_minutes=20.0,
+            round_by="day",
+        )
+        calibration = evaluate_historical_calibration(points)
+        print()
+        print(
+            format_historical_report(
+                f"{intraday_symbol} intraday bars, 15-minute-window calibration "
+                f"({len(intraday_bars)} bars, NYSE hours only)",
+                vol_summary,
+                calibration,
+            )
+        )
+        # Multiple rounds of analysis, one per trading day -- these are the
+        # real 15-minute sessions (the same window length and horizon
+        # Kalshi's contracts use), walked forward day by day rather than
+        # judged on one single split.
+        print()
+        print(
+            format_walkforward_report(
+                f"{intraday_symbol} 15-min sessions, day-by-day", run_walkforward_rounds(points)
+            )
+        )
+        # "Learn behaviors of GLD": a real fitted sigma multiplier by vol
+        # regime and time-of-day session, from real historical price
+        # action -- this is CLAUDE.md's learned component #2 (volatility
+        # scaling), just fit on GLD's spot-price history instead of live
+        # recorded ticks because there's vastly more of it. Session
+        # bucketing needs real intraday time variation, so this is only
+        # meaningful on the intraday dataset, not the daily one.
+        print()
+        print(
+            format_vol_multiplier_report(
+                fit_gld_session_vol_multipliers(
+                    points, settings.volatility.vol_spike_limit, settings.learning.min_bucket_n
+                ),
+                settings.learning.min_bucket_n,
+            )
+        )
+
+    print()
+    print(
+        "NOTE: this is a spot-price/model-calibration check on real historical GLD\n"
+        "prices, not a trading backtest -- no historical Kalshi orderbook, spread, or\n"
+        "fee data exists for past dates, so it cannot produce fill/P&L numbers or a\n"
+        "Proposal (that requires real recorded round trips, per CLAUDE.md). The\n"
+        "walk-forward rounds above show whether a finding held up session after\n"
+        "session rather than in one lucky split, and the fitted volatility-multiplier\n"
+        "table is CLAUDE.md's learned component #2, fit on real GLD history -- but\n"
+        "none of this is applied to live trading automatically. Use it to\n"
+        "sanity-check the fair-value formula and config.yaml's volatility defaults by\n"
+        "hand, not as a performance result. See docs/historical_calibration.md."
+    )
+
+
+def _load_settled_windows(
+    conn: sqlite3.Connection, start: datetime | None, end: datetime | None
+) -> list[WindowRef]:
+    out = []
+    for ticker, open_t, close_t, result in conn.execute(
+        "SELECT w.ticker, w.open_time, w.close_time, s.result FROM windows w "
+        "JOIN settlements s ON s.ticker = w.ticker WHERE s.result IN ('yes','no') "
+        "ORDER BY w.open_time"
+    ):
+        o, c = datetime.fromisoformat(open_t), datetime.fromisoformat(close_t)
+        if (start and o < start) or (end and c > end):
+            continue
+        out.append(WindowRef(ticker, o, c, result))
+    return out
+
+
+def _quote_fetcher(conn: sqlite3.Connection, max_staleness_s: float = 120.0):
+    """The book at time t is the latest update at or before t -- snapshots are
+    only written on change, so a quiet book simply has an older last update."""
+
+    def quote_at(ticker: str, t: datetime) -> BookQuote | None:
+        row = conn.execute(
+            "SELECT yes_bid, yes_ask, no_bid, no_ask, receive_time FROM book_snapshots "
+            "WHERE window_ticker = ? AND receive_time <= ? ORDER BY receive_time DESC LIMIT 1",
+            (ticker, t.isoformat()),
+        ).fetchone()
+        if row is None:
+            return None
+        rt = datetime.fromisoformat(row[4])
+        if (t - rt).total_seconds() > max_staleness_s:
+            return None
+        return BookQuote(*(Decimal(x) for x in row[:4]), rt)
+
+    return quote_at
+
+
+async def _run_backfill(settings: Settings, days: int, db: str) -> None:
+    conn = open_history(Path(db))
+    since = datetime.now(UTC) - timedelta(days=days)
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        n = await backfill_windows(conn, settings.kalshi.series_ticker, since, client)
+        print(f"windows: +{n} settled windows since {since.date()} (public, keyless)")
+        n = await backfill_candles(conn, settings.kalshi.series_ticker, client)
+        print(f"candles: fetched minute quotes for {n} windows")
+        lo = conn.execute("SELECT MIN(open_time) FROM kalshi_windows").fetchone()[0]
+        hi = conn.execute("SELECT MAX(close_time) FROM kalshi_windows").fetchone()[0]
+        if lo and hi:
+            n = await backfill_paxg(
+                conn,
+                datetime.fromisoformat(lo) - timedelta(hours=1),
+                datetime.fromisoformat(hi) + timedelta(minutes=5),
+                client,
+            )
+            print(f"paxg: +{n} one-minute PAXG-USD closes from Coinbase (public, keyless)")
+    tw = conn.execute("SELECT COUNT(*) FROM kalshi_windows").fetchone()[0]
+    tc = conn.execute("SELECT COUNT(DISTINCT ticker) FROM kalshi_candles").fetchone()[0]
+    print(f"history db {db}: {tw} windows, {tc} with candles")
+
+
+def _history_quote_fetcher(conn: sqlite3.Connection, mode: str = "next_open"):
+    """mode "next_open": the FIRST bid/ask of the minute after the signal minute
+    (`open_dollars` of the next candle). mode "close": the closing bid/ask of
+    the minute that just ended -- the quote actually known at the signal
+    instant, so it can't contain any information from after the signal."""
+    table: dict[str, dict[int, tuple[float, float]]] = {}
+    col = "yes_bid_open, yes_ask_open" if mode == "next_open" else "yes_bid_close, yes_ask_close"
+    for ticker, end_ts, bid_o, ask_o in conn.execute(
+        f"SELECT ticker, end_ts, {col} FROM kalshi_candles"
+    ):
+        if bid_o is not None and ask_o is not None:
+            table.setdefault(ticker, {})[end_ts] = (bid_o, ask_o)
+    offset = 60 if mode == "next_open" else 0
+
+    def quote_at(ticker: str, t: datetime) -> BookQuote | None:
+        boundary = t.replace(second=0, microsecond=0)
+        got = table.get(ticker, {}).get(int(boundary.timestamp()) + offset)
+        if got is None:
+            return None
+        bid, ask = got
+        if not (0.0 < bid < ask < 1.0) or ask - bid > 0.10:
+            return None
+        yb, ya = Decimal(str(bid)), Decimal(str(ask))
+        return BookQuote(yb, ya, Decimal(1) - ya, Decimal(1) - yb, t)
+
+    return quote_at
+
+
+def _history_windows(conn: sqlite3.Connection) -> tuple[list[WindowRef], dict[str, float]]:
+    import math
+
+    windows, truth = [], {}
+    for ticker, o, c, s0, sv, res in conn.execute(
+        "SELECT ticker, open_time, close_time, s0, settle_value, result FROM kalshi_windows "
+        "ORDER BY open_time"
+    ):
+        windows.append(WindowRef(ticker, datetime.fromisoformat(o), datetime.fromisoformat(c), res))
+        if s0 and sv:
+            truth[ticker] = math.log(sv / s0)
+    return windows, truth
+
+
+FEATURE_SETS: dict[str, tuple[str, ...]] = {
+    "base": BASE,
+    "+late": (*BASE, "fair_x_late", "mid_x_late"),
+    "+momentum": (*BASE, "mom1"),
+    "+spread/activity": (*BASE, "spread", "logvol"),
+    "+multi-vol": (*BASE, "logit_fair_h300", "logit_fair_h1800"),
+    "+time-of-day": (*BASE, "hsin", "hcos"),
+    "+paxg-momentum": (*BASE, "ret5z"),
+    "all": (
+        *BASE, "fair_x_late", "mid_x_late", "mom1", "spread", "logvol",
+        "logit_fair_h300", "logit_fair_h1800", "hsin", "hcos", "ret5z",
+    ),
+}
+
+
+def _history_extras(conn: sqlite3.Connection, settings: Settings, series: dict[float, GldSeries]):
+    import math
+
+    from gold_edge.learning.blend import _logit
+
+    candles: dict[str, dict[int, tuple[float, float]]] = {}
+    for ticker, end_ts, bid_c, ask_c, vol in conn.execute(
+        "SELECT ticker, end_ts, yes_bid_close, yes_ask_close, volume FROM kalshi_candles"
+    ):
+        if bid_c is not None and ask_c is not None:
+            candles.setdefault(ticker, {})[end_ts] = ((bid_c + ask_c) / 2.0, vol or 0.0)
+    main = series[900.0]
+
+    def extra_at(w: WindowRef, minute: int, t: datetime, fair: float) -> dict[str, float]:
+        ts = int(t.timestamp())
+        table = candles.get(w.ticker, {})
+        cur, prev = table.get(ts), table.get(ts - 60)
+        out = {"mom1": (cur[0] - prev[0]) if cur and prev else 0.0,
+               "logvol": math.log1p(cur[1]) if cur else 0.0}
+        hour = t.hour + t.minute / 60.0
+        angle = 2 * math.pi * hour / 24
+        out["hsin"], out["hcos"] = math.sin(angle), math.cos(angle)
+        s, s0 = main.price_at(t), main.price_at(w.open_time)
+        sigma5 = main.sigma_at(t)
+        p5 = main.price_at(t - timedelta(minutes=5))
+        out["ret5z"] = (
+            math.log(s / p5) / (sigma5 * math.sqrt(5.0)) if s and p5 and sigma5 else 0.0
+        )
+        for half_life, key in ((300.0, "logit_fair_h300"), (1800.0, "logit_fair_h1800")):
+            g = series[half_life]
+            sg = g.sigma_at(t)
+            out[key] = (
+                _logit(
+                    compute_fair_value(
+                        s, s0, sg, float(15 - minute),
+                        settings.model.min_fair_value, settings.model.max_fair_value,
+                    ).yes
+                )
+                if s and s0 and sg
+                else _logit(fair)
+            )
+        return out
+
+    return extra_at
+
+
+def _run_study_features(settings: Settings, db: str, holdout_days: int) -> None:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    windows, _ = _history_windows(conn)
+    bars = densify(load_paxg_bars(conn))
+    short = settings.volatility.short_horizon_s
+    series = {h: GldSeries(bars, h, short) for h in (300.0, 900.0, 1800.0)}
+    rows = build_study_rows(
+        windows, series[900.0], _history_quote_fetcher(conn, "close"), settings.model, 1.5,
+        extra_at=_history_extras(conn, settings, series),
+    )
+    dev, hold = split_dev_holdout(rows, holdout_days)
+    print(
+        f"{len(rows)} rows: DEV {len({r.ticker for r in dev})} windows (feature choice), "
+        f"HOLDOUT {len({r.ticker for r in hold})} windows (last {holdout_days} days, scored once)"
+    )
+    print("\n=== DEV: expanding walk-forward, each set scored on days it never trained on ===")
+    dev_res = {}
+    for name, feats in FEATURE_SETS.items():
+        res = walk_forward(dev, feats)
+        if res is None:
+            continue
+        dev_res[name] = res
+        print(
+            f"{name:18s} log-loss {res.log_loss:.4f} (market {res.market_log_loss:.4f})  "
+            f"Brier vs market {res.diff_vs_market:+.5f} [{res.ci_low:+.5f}, {res.ci_high:+.5f}]"
+        )
+    base = dev_res["base"]
+    best_name = min(dev_res, key=lambda k: dev_res[k].log_loss)
+    chosen = best_name
+    if best_name != "base":
+        d, lo, hi = paired_diff(base, dev_res[best_name])
+        print(f"\nbest on DEV: {best_name}; vs base Brier gain {d:+.5f} CI [{lo:+.5f}, {hi:+.5f}]")
+        if not lo > 0:
+            chosen = "base"
+            print("gain not reliable -> keeping the base blend (pre-declared rule)")
+    print(f"\n=== HOLDOUT (never used for any choice above): chosen = {chosen} ===")
+    finals = {n: fit_and_score(dev, hold, FEATURE_SETS[n]) for n in {"base", chosen}}
+    for n, res in finals.items():
+        if res is None:
+            continue
+        print(
+            f"{n:18s} log-loss {res.log_loss:.4f} (market {res.market_log_loss:.4f})  "
+            f"Brier vs market {res.diff_vs_market:+.5f} [{res.ci_low:+.5f}, {res.ci_high:+.5f}]"
+        )
+        for th in (0.03, 0.05, 0.08):
+            h = hold_to_settlement(res.rows, settings.fees, th, n_boot=500)
+            if h.n_trades:
+                print(
+                    f"   gap>={th:.2f}: trades={h.n_trades} win={h.win_rate:.1%} "
+                    f"mean net ${h.mean_pnl:+.3f} CI [${h.ci_low:+.3f}, ${h.ci_high:+.3f}]"
+                )
+    if chosen != "base" and finals[chosen] and finals["base"]:
+        d, lo, hi = paired_diff(finals["base"], finals[chosen])
+        print(f"holdout, {chosen} vs base: Brier gain {d:+.5f} CI [{lo:+.5f}, {hi:+.5f}]")
+
+
+def _run_train_blend(settings: Settings, db: str, half_life: float, out: str) -> None:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    windows, _ = _history_windows(conn)
+    gld = GldSeries(
+        densify(load_paxg_bars(conn)), half_life, settings.volatility.short_horizon_s
+    )
+    rows = build_study_rows(
+        windows, gld, _history_quote_fetcher(conn, "close"), settings.model, delay_s=1.5
+    )
+    model = fit_blend(rows)
+    artifact = make_artifact(
+        model.weights, half_life, len({r.ticker for r in rows}), datetime.now(UTC)
+    )
+    artifact.save(Path(out))
+    a, b, c = artifact.weights
+    print(
+        f"Trained on {artifact.n_windows} windows / {len(rows)} rows (all history, so this "
+        f"is a SHADOW candidate only -- its honest out-of-sample test is the live shadow).\n"
+        f"logit(p) = {a:+.3f} + {b:.3f}*logit(market) + {c:+.3f}*logit(model)  "
+        f"[half-life {half_life:.0f}s, version {artifact.version_hash}] -> {out}"
+    )
+
+
+async def _seed_prices(client: httpx.AsyncClient, prices: PriceState) -> int:
+    end = datetime.now(UTC)
+    rows = await _history_get(
+        client,
+        f"{COINBASE_BASE}/products/PAXG-USD/candles",
+        {
+            "granularity": 60,
+            "start": (end - timedelta(minutes=150)).isoformat(),
+            "end": end.isoformat(),
+        },
+    )
+    bars = densify(parse_coinbase_candles(rows))
+    for b in bars:
+        prices.on_tick(b.close, b.timestamp + timedelta(seconds=60))
+    for b in bars:
+        prices.advance(b.timestamp + timedelta(seconds=60))
+    return len(bars)
+
+
+async def _shadow_feed(settings: Settings, prices: PriceState) -> None:
+    client = ProxyFeedClient(settings.gold_proxy.ws_url, settings.gold_proxy.product_id)
+    async for tick in client.ticks():
+        prices.on_tick(tick.price, tick.publish_time)
+
+
+async def _run_shadow(settings: Settings, artifact_path: str, db: str, threshold: float) -> None:
+    artifact = BlendArtifact.load(Path(artifact_path))
+    prices = PriceState(artifact.half_life_s, settings.volatility.short_horizon_s)
+    store = ShadowStore(Path(db))
+    engine = ShadowEngine(artifact, settings.model, settings.fees, threshold, prices, store)
+    windows: dict[str, ShadowWindow] = {}
+    print(
+        f"SHADOW mode (no orders, no API keys). blend {artifact.version_hash} "
+        f"weights={artifact.weights} threshold={threshold} -> {db}",
+        flush=True,
+    )
+    async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        n = await _seed_prices(client, prices)
+        print(f"seeded {n} minutes of PAXG history; sigma={prices.sigma}", flush=True)
+        feed = asyncio.create_task(
+            _supervised("shadow-feed", lambda: _shadow_feed(settings, prices))
+        )
+        last_boundary: datetime | None = None
+        last_settle = datetime.now(UTC)
+        try:
+            while True:
+                now = datetime.now(UTC)
+                boundary = now.replace(second=0, microsecond=0)
+                if boundary != last_boundary and (now - boundary).total_seconds() >= 1.5:
+                    last_boundary = boundary
+                    try:
+                        prices.advance(boundary)
+                        data = await _history_get(
+                            client,
+                            f"{KALSHI_BASE}/markets",
+                            {"series_ticker": settings.kalshi.series_ticker,
+                             "status": "open", "limit": 20},
+                        )
+                        for m in data.get("markets", []):
+                            o = datetime.fromisoformat(m["open_time"].replace("Z", "+00:00"))
+                            c = datetime.fromisoformat(m["close_time"].replace("Z", "+00:00"))
+                            if not (o <= boundary < c):
+                                continue
+                            w = windows.setdefault(m["ticker"], ShadowWindow(m["ticker"], o, c))
+                            msg = engine.on_boundary(w, boundary, parse_market_quote(m, now))
+                            if msg:
+                                print(f"{boundary:%H:%M} {msg}", flush=True)
+                    except Exception as exc:  # noqa: BLE001 - keep the shadow alive
+                        print(f"shadow step error ({exc!r}); continuing", flush=True)
+                if (now - last_settle).total_seconds() >= 20:
+                    last_settle = now
+                    for ticker in store.unsettled_tickers():
+                        try:
+                            mk = (
+                                await _history_get(client, f"{KALSHI_BASE}/markets/{ticker}", {})
+                            ).get("market", {})
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if mk.get("result") in ("yes", "no"):
+                            pnl = store.settle(ticker, mk["result"])
+                            print(
+                                f"settled {ticker}: {mk['result']}  shadow pnl {pnl:+.3f}",
+                                flush=True,
+                            )
+                await asyncio.sleep(0.25)
+        finally:
+            feed.cancel()
+
+
+def _run_shadow_report(settings: Settings, db: str) -> None:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    obs = conn.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT ticker) FROM shadow_observations"
+    ).fetchone()
+    trades = conn.execute(
+        "SELECT ticker, side, pnl, substr(ts,1,10) FROM shadow_trades WHERE pnl IS NOT NULL"
+    ).fetchall()
+    pending = conn.execute("SELECT COUNT(*) FROM shadow_trades WHERE pnl IS NULL").fetchone()[0]
+    print(f"observations: {obs[0]} across {obs[1]} windows;  shadow trades settled: {len(trades)}"
+          f"  pending: {pending}")
+    if not trades:
+        print("no settled shadow trades yet")
+        return
+    pnls = {t[0]: [t[2]] for t in trades}
+    mean, lo, hi = _cluster_bootstrap(pnls, 2000, random.Random(0))
+    wins = sum(1 for t in trades if t[2] > 0)
+    days = len({t[3] for t in trades})
+    need = settings.learning.min_proposal_trades
+    print(
+        f"win rate {wins / len(trades):.1%}   mean net P&L/contract ${mean:+.3f}   "
+        f"95% CI [${lo:+.3f}, ${hi:+.3f}]   (backtest expected about +$0.08)"
+    )
+    print(
+        f"promotion progress: {len(trades)}/{need} settled trades, {days}/"
+        f"{settings.learning.shadow_sessions} shadow days, CI lower bound "
+        f"{'above' if lo > 0 else 'NOT above'} zero.  Nothing is promoted automatically."
+    )
+
+
+def _run_study_history(
+    settings: Settings, db: str, quote_mode: str, shift_min: int, half_lives: list[float]
+) -> None:
+    import math
+
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    windows, truth = _history_windows(conn)
+    bars = densify(load_paxg_bars(conn))
+    if shift_min:
+        # PLACEBO: delay the price series so it no longer lines up with the
+        # windows. Any real information in the model must vanish; if profit
+        # survives, it came from the quotes/selection, not from the model.
+        bars = [PriceBar(b.timestamp + timedelta(minutes=shift_min), b.close) for b in bars]
+    quote_at = _history_quote_fetcher(conn, quote_mode)
+    print(
+        f"{len(windows)} settled windows, {len(bars)} PAXG minute prices (all hours); "
+        f"quote_mode={quote_mode} placebo_shift_min={shift_min}"
+    )
+
+    for half_life in half_lives:
+        gld = GldSeries(bars, half_life, settings.volatility.short_horizon_s)
+        compared, agree = proxy_agreement(windows, gld)
+        pairs = [
+            (truth[w.ticker], math.log(gld.price_at(w.close_time) / gld.price_at(w.open_time)))
+            for w in windows
+            if w.ticker in truth and gld.price_at(w.open_time) and gld.price_at(w.close_time)
+        ]
+        corr = float("nan")
+        if len(pairs) > 2:
+            xs, ys = zip(*pairs, strict=True)
+            corr = float(np.corrcoef(xs, ys)[0, 1])
+        print()
+        print(f"##### vol half-life {half_life:.0f}s #####")
+        print(f"PAXG proxy audit vs Kalshi's true S0/settlement: return correlation {corr:.3f}")
+        rows = build_study_rows(windows, gld, quote_at, settings.model, delay_s=1.5)
+        print(
+            format_study(
+                "raw model vs market (all windows)",
+                compared,
+                agree,
+                compare_brier(rows, n_boot=500),
+                [
+                    hold_to_settlement(rows, settings.fees, th, n_boot=500)
+                    for th in (0.03, 0.05, 0.08)
+                ],
+            )
+        )
+        wf = walk_forward_blend(rows, n_boot=500)
+        print("\n=== learned blend of market + model ===")
+        print(format_blend(wf))
+        if wf is not None:
+            print("hold-to-settlement using ONLY the held-out blend probabilities:")
+            for th in (0.03, 0.05, 0.08):
+                h = hold_to_settlement(wf.scored_rows, settings.fees, th, n_boot=500)
+                if h.n_trades == 0:
+                    print(f"  gap>={th:.2f}: no trades")
+                else:
+                    print(
+                        f"  gap>={th:.2f}: trades={h.n_trades}  win_rate={h.win_rate:.1%}  "
+                        f"mean_net_pnl/contract=${h.mean_pnl:+.3f}  "
+                        f"95% CI [${h.ci_low:+.3f}, ${h.ci_high:+.3f}]"
+                    )
+
+
+async def _run_study_market(
+    settings: Settings, start: str | None, end: str | None, delay_s: float, cache: str
+) -> None:
+    if not settings.sqlite_path.exists():
+        print(f"No recorded data found at {settings.sqlite_path}.")
+        sys.exit(1)
+    cache_path = Path(cache)
+    try:
+        fresh = await fetch_yahoo_chart("GLD", "1m", "7d")
+        save_gld_cache(cache_path, fresh)
+        print(f"Fetched {len(fresh)} GLD 1m bars (free Yahoo); cache now at {cache_path}")
+    except httpx.HTTPError as exc:
+        print(f"Yahoo fetch failed ({exc}); using cached bars only")
+    bars = load_gld_cache(cache_path)
+    print(f"GLD 1m bars available: {len(bars)}")
+
+    conn = sqlite3.connect(f"file:{settings.sqlite_path}?mode=ro", uri=True)
+    start_dt = datetime.fromisoformat(start).replace(tzinfo=UTC) if start else None
+    end_dt = datetime.fromisoformat(end).replace(tzinfo=UTC) if end else None
+    windows = _load_settled_windows(conn, start_dt, end_dt)
+    print(f"Settled Kalshi windows in range: {len(windows)}")
+    quote_at = _quote_fetcher(conn)
+
+    # Live half-life (matches the recorder's 1s ticks) vs a longer one that
+    # actually spans several 1-minute bars; both shown, neither picked.
+    for half_life in (settings.volatility.ewma_half_life_s, 900.0):
+        gld = GldSeries(bars, half_life, settings.volatility.short_horizon_s)
+        compared, agree = proxy_agreement(windows, gld)
+        rows = build_study_rows(windows, gld, quote_at, settings.model, delay_s)
+        print()
+        print(
+            format_study(
+                f"vol half-life {half_life:.0f}s",
+                compared,
+                agree,
+                compare_brier(rows),
+                [hold_to_settlement(rows, settings.fees, th) for th in (0.03, 0.05, 0.08)],
+            )
+        )
+    print(
+        "\nNOTE: GLD stands in for spot only during NYSE hours, ~100 independent windows at "
+        "best -- treat any result as a lead to confirm with live-recorded spot data, not proof."
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="gold-edge")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -680,6 +1418,75 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("rollback", help="Restore the previously promoted config version.")
 
+    history_parser = sub.add_parser(
+        "analyze-history",
+        help="Check the fair-value formula and volatility defaults against years of "
+        "free historical GLD prices (calibration check only, not a trading backtest).",
+    )
+    history_parser.add_argument("--daily-symbol", default="GLD")
+    history_parser.add_argument("--daily-range", default="20y", help="Yahoo range; keep <= ~20y")
+    history_parser.add_argument("--intraday-symbol", default="GLD")
+    history_parser.add_argument("--intraday-interval", default="1m")
+    history_parser.add_argument("--intraday-range", default="7d", help="Yahoo cap for 1m bars")
+
+    backfill_parser = sub.add_parser(
+        "backfill",
+        help="Download months of settled KXGOLD15M windows, minute bid/ask candles and "
+        "PAXG prices from free public endpoints (no API keys) into data/history.sqlite.",
+    )
+    backfill_parser.add_argument("--days", type=int, default=60)
+    backfill_parser.add_argument("--db", default="data/history.sqlite")
+
+    history_study_parser = sub.add_parser(
+        "study-history",
+        help="Train/test on the backfilled history: proxy audit, model vs market, and a "
+        "walk-forward learned blend (offline).",
+    )
+    history_study_parser.add_argument("--db", default="data/history.sqlite")
+    history_study_parser.add_argument(
+        "--quote-mode", choices=["next_open", "close"], default="close"
+    )
+    history_study_parser.add_argument("--shift-min", type=int, default=0, help="placebo shift")
+    history_study_parser.add_argument(
+        "--half-life", type=float, action="append", dest="half_lives"
+    )
+
+    features_parser = sub.add_parser(
+        "study-features",
+        help="Test richer blend features with a dev walk-forward and a one-shot holdout.",
+    )
+    features_parser.add_argument("--db", default="data/history.sqlite")
+    features_parser.add_argument("--holdout-days", type=int, default=14)
+
+    train_parser = sub.add_parser(
+        "train-blend", help="Fit the market+model blend on the backfilled history -> artifact."
+    )
+    train_parser.add_argument("--db", default="data/history.sqlite")
+    train_parser.add_argument("--half-life", type=float, default=900.0)
+    train_parser.add_argument("--out", default="data/blend_model.json")
+
+    shadow_parser = sub.add_parser(
+        "shadow",
+        help="Run the blend LIVE in shadow mode: records what it would trade, never orders. "
+        "Keyless (public Kalshi + Coinbase data).",
+    )
+    shadow_parser.add_argument("--artifact", default="data/blend_model.json")
+    shadow_parser.add_argument("--db", default="data/shadow.sqlite")
+    shadow_parser.add_argument("--threshold", type=float, default=0.05)
+
+    report_parser = sub.add_parser("shadow-report", help="Summarise shadow results vs the gates.")
+    report_parser.add_argument("--db", default="data/shadow.sqlite")
+
+    study_parser = sub.add_parser(
+        "study-market",
+        help="Score the fair-value model against real recorded Kalshi prices on settled "
+        "windows, using free GLD minute bars as the price proxy (offline, no API keys).",
+    )
+    study_parser.add_argument("--start", help="ISO datetime; only windows opening at/after this")
+    study_parser.add_argument("--end", help="ISO datetime; only windows closing at/before this")
+    study_parser.add_argument("--delay-s", type=float, default=1.5)
+    study_parser.add_argument("--cache", default="data/gld_1m_cache.json")
+
     args = parser.parse_args(argv)
     settings = get_settings()
 
@@ -711,6 +1518,37 @@ def main(argv: list[str] | None = None) -> None:
         _run_promote(settings, args.proposal_id)
     elif args.command == "rollback":
         _run_rollback(settings)
+    elif args.command == "study-features":
+        _run_study_features(settings, args.db, args.holdout_days)
+    elif args.command == "train-blend":
+        _run_train_blend(settings, args.db, args.half_life, args.out)
+    elif args.command == "shadow":
+        asyncio.run(_run_shadow(settings, args.artifact, args.db, args.threshold))
+    elif args.command == "shadow-report":
+        _run_shadow_report(settings, args.db)
+    elif args.command == "study-history":
+        _run_study_history(
+            settings,
+            args.db,
+            args.quote_mode,
+            args.shift_min,
+            args.half_lives or [settings.volatility.ewma_half_life_s, 900.0],
+        )
+    elif args.command == "backfill":
+        asyncio.run(_run_backfill(settings, args.days, args.db))
+    elif args.command == "study-market":
+        asyncio.run(_run_study_market(settings, args.start, args.end, args.delay_s, args.cache))
+    elif args.command == "analyze-history":
+        asyncio.run(
+            _run_analyze_history(
+                settings,
+                args.daily_symbol,
+                args.daily_range,
+                args.intraday_symbol,
+                args.intraday_interval,
+                args.intraday_range,
+            )
+        )
 
 
 if __name__ == "__main__":

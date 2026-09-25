@@ -41,7 +41,9 @@ class SignalStatus(StrEnum):
 
 
 class Tick(BaseModel):
-    """One Pyth price update."""
+    """One price update, from Pyth or from the 24/7 gold proxy fallback
+    (see feeds/gold_proxy.py). `source` records which, so recorded data and
+    live payloads never misrepresent a proxy-derived price as true spot."""
 
     symbol: str
     price: float
@@ -49,6 +51,7 @@ class Tick(BaseModel):
     expo: int
     publish_time: datetime
     receive_time: datetime
+    source: str = "pyth_xau"
 
 
 class BookSnapshot(BaseModel):

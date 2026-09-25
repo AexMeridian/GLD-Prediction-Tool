@@ -48,6 +48,17 @@ class TestBuildDelayProfile:
         assert profile.n == 0
         assert profile.is_learned is False
 
+    def test_none_delay_for_pure_expiry_is_excluded_but_still_counts_as_missed(self):
+        """A signal the user never touched at all (no fill, no explicit
+        skip) has no real delay to measure -- see cli._load_fill_latency_samples."""
+        fills = [sample(delay=1.0)] * 3 + [
+            FillLatencySample("s2", "BUY", "enter_edge", None, True) for _ in range(2)
+        ]
+        profile = build_delay_profile(fills)
+        assert profile.n == 3
+        assert len(profile.samples) == 3
+        assert profile.miss_rate_by_reason["enter_edge"] == pytest.approx(2 / 5)
+
 
 class TestDelayProfileMethods:
     def test_sample_delay_raises_without_data(self):

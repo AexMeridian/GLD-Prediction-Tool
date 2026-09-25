@@ -24,7 +24,10 @@ class FillLatencySample:
     signal_id: str
     action: str  # "BUY" | "SELL"
     reason: str  # the originating signal's `reason` (e.g. "enter_edge", "stop")
-    delay_s: float
+    # None for a signal that expired with no user action at all (never
+    # filled or explicitly skipped) -- there's no real click latency to
+    # measure, but it still counts toward miss_rate_by_reason below.
+    delay_s: float | None
     was_missed: bool  # True if this candidate expired/was skipped rather than filled
 
 
@@ -61,7 +64,7 @@ class DelayProfile:
 
 def build_delay_profile(fill_samples: Sequence[FillLatencySample]) -> DelayProfile:
     filled = [s for s in fill_samples if not s.was_missed]
-    delays = [s.delay_s for s in filled]
+    delays = [s.delay_s for s in filled if s.delay_s is not None]
 
     by_reason_total: dict[str, int] = {}
     by_reason_missed: dict[str, int] = {}

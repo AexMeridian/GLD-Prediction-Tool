@@ -24,9 +24,33 @@ pyth:
   price_feed_symbol: "Metal.XAU/USD"
   price_feed_id: "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"
   # Search term for re-looking up this feed's metadata (market_hours, used
-  # to detect the daily trading halt independent of message-arrival gaps).
-  # Must uniquely match exactly the feed above via /v2/price_feeds.
+  # to detect trading closures independent of message-arrival gaps). Must
+  # uniquely match exactly the feed above via /v2/price_feeds.
+  # Correction 2026-09-18: this isn't a short daily halt -- XAU/USD's own
+  # schedule closes Friday ~17:00 ET through Sunday ~18:00 ET (the whole
+  # weekend), confirmed live (frozen 3+ hours, REST /latest agrees, feed
+  # metadata's `schedule` shows Friday=0000-1700, Saturday=closed all day).
+  # See docs/contract_notes.md. gold_proxy below covers this gap.
   price_feed_query: "XAU"
+
+# 24/7 fallback for exactly the gap the free Pyth plan can't cover (daily
+# XAU/USD halt + weekends): PAXG, a token redeemable 1:1 for physical gold,
+# streamed from Coinbase's public Exchange WS (no API key, no account
+# needed — see docs/contract_notes.md and feeds/gold_proxy.py). Never used
+# as the primary price while Pyth XAU/USD is open and fresh; only stands in
+# once that feed goes stale, and always basis-adjusted via model/basis.py
+# rather than trusted raw.
+gold_proxy:
+  ws_url: "wss://ws-feed.exchange.coinbase.com"
+  product_id: "PAXG-USD"
+  # Half-life for the EWMA tracking (pyth_price - proxy_price). Short
+  # enough to follow real drift in the premium, long enough that a single
+  # noisy trade print doesn't swing the estimate.
+  basis_half_life_s: 300.0
+  # Reject a (pyth, proxy) pair for basis tracking if the two ticks are
+  # more than this far apart in time -- comparing a fresh price to a stale
+  # one would corrupt the offset estimate.
+  basis_max_pair_age_s: 30.0
 
 fees:
   # fee = ceil_to_cent(fee_multiplier * 0.07 * contracts * price * (1 - price))
