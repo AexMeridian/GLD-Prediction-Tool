@@ -54,10 +54,29 @@ class BookQuote:
     no_bid: Decimal
     no_ask: Decimal
     receive_time: datetime
+    # Top-of-book contract sizes, when the source provides them (Kalshi's
+    # public /markets listing does; historical candlesticks and GLD-proxy
+    # reconstructions don't) -- Stage 4's order-flow-imbalance experiment
+    # (CLAUDE.md: "extend blend_shadow.py's quote parsing to pull a couple
+    # of book levels"). None means "unknown," never zero.
+    yes_bid_size: Decimal | None = None
+    yes_ask_size: Decimal | None = None
 
     @property
     def yes_mid(self) -> float:
         return float((self.yes_bid + self.yes_ask) / 2)
+
+    @property
+    def size_imbalance(self) -> float | None:
+        """(bid size - ask size) / (bid size + ask size) in [-1, 1]; positive
+        means more resting size wants to buy YES than sell it. None when
+        sizes aren't known."""
+        if self.yes_bid_size is None or self.yes_ask_size is None:
+            return None
+        total = self.yes_bid_size + self.yes_ask_size
+        if total <= 0:
+            return None
+        return float((self.yes_bid_size - self.yes_ask_size) / total)
 
 
 @dataclass(frozen=True)

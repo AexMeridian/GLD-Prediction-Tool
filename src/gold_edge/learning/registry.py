@@ -213,3 +213,152 @@ class Registry:
         )
         remaining_promoted = [v for v in self.versions if v.promoted]
         return remaining_promoted[-1] if remaining_promoted else None
+
+
+# --- Probability-model promotion (parallel to the threshold-change path
+# above): today's `Proposal`/`ConfigVersion` are strictly
+# `param_changes: dict[str, float]` with a replay-derived P&L gate, which
+# doesn't fit swapping in a learned probability model (a blend of market
+# mid + model fair value, or a calibrated version of one). Rather than
+# overload `Proposal` with fields that don't apply to threshold changes,
+# this is its own explicitly-named path, sharing the same "check every
+# gate independently, one promotion per day, never auto-promotes" spirit. ---
+
+
+@dataclass(frozen=True)
+class ModelProposalEvidence:
+    """Evidence a probability-model candidate must carry to be gated, per
+    model_proposer.py's `ProbabilityModelProposal` (kept here as a narrow
+    protocol so registry.py doesn't import model_proposer.py -- the two
+    would otherwise form a cycle, since model_proposer.py needs
+    `evaluate_model_promotion_gates` from here)."""
+
+    n_holdout_windows: int
+    holdout_brier_ci_low: float
+    n_shadow_trades: int
+    n_shadow_days: int
+    shadow_pnl_ci_low: float
+
+
+@dataclass(frozen=True)
+class ModelVersion:
+    version_hash: str
+    kind: str
+    artifact_path: str
+    created_at: datetime
+    evidence: dict[str, str]
+    promoted: bool = False
+
+
+@dataclass(frozen=True)
+class RejectedModelProposal:
+    version_hash: str
+    rejected_at: datetime
+    reasons: list[str]
+
+
+def evaluate_model_promotion_gates(
+    evidence: ModelProposalEvidence, learning_cfg: LearningConfig, user_approved: bool
+) -> GateResult:
+    """Mirrors `evaluate_promotion_gates`'s style: every gate checked
+    independently, every failure reason reported. Reuses the same
+    `min_proposal_trades`/`shadow_sessions` numbers CLAUDE.md already
+    specifies for threshold changes -- a probability-model swap is at
+    least as consequential, not less."""
+    reasons: list[str] = []
+
+    if evidence.n_holdout_windows < learning_cfg.min_proposal_trades:
+        reasons.append(
+            f"only {evidence.n_holdout_windows} held-out windows "
+            f"(need >= {learning_cfg.min_proposal_trades})"
+        )
+    if evidence.holdout_brier_ci_low <= 0:
+        reasons.append(
+            f"held-out Brier-vs-market CI lower bound {evidence.holdout_brier_ci_low:+.5f} "
+            "is not above zero"
+        )
+    if evidence.n_shadow_trades < learning_cfg.min_proposal_trades:
+        reasons.append(
+            f"only {evidence.n_shadow_trades} settled live-shadow trades "
+            f"(need >= {learning_cfg.min_proposal_trades})"
+        )
+    if evidence.n_shadow_days < learning_cfg.shadow_sessions:
+        reasons.append(
+            f"only {evidence.n_shadow_days} shadow days (need >= {learning_cfg.shadow_sessions})"
+        )
+    if evidence.shadow_pnl_ci_low <= 0:
+        reasons.append(
+            f"live-shadow P&L CI lower bound ${evidence.shadow_pnl_ci_low:+.3f} is not above "
+            "zero -- backtest looking good is not enough on its own"
+        )
+    if not user_approved:
+        reasons.append("not yet approved by the user")
+
+    return GateResult(passed=not reasons, reasons=reasons)
+
+
+@dataclass
+class ModelRegistry:
+    """Mirrors `Registry`'s shape for the model-promotion path. The
+    one-promotion-per-day counter is passed in from outside (see
+    actions.py's `_combined_promotions_today`) rather than kept separately,
+    so a config-threshold promotion and a model promotion on the same day
+    correctly count against the same "max one promotion per day" limit."""
+
+    versions: list[ModelVersion] = field(default_factory=list)
+    rejected: list[RejectedModelProposal] = field(default_factory=list)
+
+    def promote(
+        self,
+        version_hash: str,
+        kind: str,
+        artifact_path: str,
+        evidence: dict[str, str],
+        gate_result: GateResult,
+        can_promote_today: bool,
+        now: datetime,
+    ) -> GateResult:
+        if gate_result.passed and not can_promote_today:
+            gate_result = GateResult(
+                passed=False, reasons=[*gate_result.reasons, "already promoted a change today"]
+            )
+        if not gate_result.passed:
+            self.rejected.append(
+                RejectedModelProposal(
+                    version_hash=version_hash, rejected_at=now, reasons=gate_result.reasons
+                )
+            )
+            return gate_result
+
+        self.versions.append(
+            ModelVersion(
+                version_hash=version_hash,
+                kind=kind,
+                artifact_path=artifact_path,
+                created_at=now,
+                evidence=evidence,
+                promoted=True,
+            )
+        )
+        return gate_result
+
+    def current_version(self) -> ModelVersion | None:
+        promoted = [v for v in self.versions if v.promoted]
+        return promoted[-1] if promoted else None
+
+    def rollback(self) -> ModelVersion | None:
+        promoted = [v for v in self.versions if v.promoted]
+        if not promoted:
+            return None
+        rolled_back = promoted[-1]
+        idx = self.versions.index(rolled_back)
+        self.versions[idx] = ModelVersion(
+            version_hash=rolled_back.version_hash,
+            kind=rolled_back.kind,
+            artifact_path=rolled_back.artifact_path,
+            created_at=rolled_back.created_at,
+            evidence=rolled_back.evidence,
+            promoted=False,
+        )
+        remaining_promoted = [v for v in self.versions if v.promoted]
+        return remaining_promoted[-1] if remaining_promoted else None

@@ -85,6 +85,12 @@ class LearningConfig(BaseModel):
     filter_min_prob: float
     markout_horizons_s: list[float]
     news_shock_threshold: float
+    # Path to a promoted market+model blend artifact (learning/blend_shadow.py's
+    # BlendArtifact JSON), or None to run on the raw fair-value model only
+    # (today's exact behavior). Only ever set by a human after `propose-model
+    # --promote` clears every gate -- never written by the server itself, and
+    # only read once at startup (CLAUDE.md: "no change mid-session").
+    active_model_path: str | None = None
 
 
 class RecordingConfig(BaseModel):

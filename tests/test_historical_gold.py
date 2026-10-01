@@ -1,9 +1,11 @@
-from datetime import UTC, datetime, timedelta
+import math
+from datetime import UTC, date, datetime, timedelta
 
 from gold_edge.config import ModelConfig, VolatilityConfig
 from gold_edge.learning.historical_gold import (
     PriceBar,
     build_calibration_points,
+    build_daily_lagged_return_series,
     evaluate_historical_calibration,
     fit_gld_session_vol_multipliers,
     format_historical_report,
@@ -333,3 +335,39 @@ class TestFormatVolMultiplierReport:
         table = fit_gld_session_vol_multipliers(points, vol_spike_limit=0.5, min_bucket_n=10)
         report = format_vol_multiplier_report(table, min_bucket_n=10)
         assert "multiplier=" in report
+
+
+class TestDailyLaggedReturnSeries:
+    def test_value_is_the_return_from_the_two_prior_bars(self):
+        daily_bars = [
+            PriceBar(datetime(2026, 1, 1, tzinfo=UTC), 100.0),
+            PriceBar(datetime(2026, 1, 2, tzinfo=UTC), 105.0),
+            PriceBar(datetime(2026, 1, 3, tzinfo=UTC), 110.0),
+        ]
+        series = build_daily_lagged_return_series(daily_bars)
+        # Jan 3's entry uses only Jan 1 -> Jan 2 (both strictly before Jan 3).
+        assert abs(series.at(date(2026, 1, 3)) - math.log(105.0 / 100.0)) < 1e-9
+
+    def test_forward_fills_across_non_trading_days(self):
+        daily_bars = [
+            PriceBar(datetime(2026, 1, 1, tzinfo=UTC), 100.0),
+            PriceBar(datetime(2026, 1, 2, tzinfo=UTC), 105.0),
+            PriceBar(datetime(2026, 1, 5, tzinfo=UTC), 110.0),  # weekend gap
+        ]
+        series = build_daily_lagged_return_series(daily_bars)
+        # No bar for Jan 3/4 -- should carry forward Jan 5's value, which
+        # itself is only built from Jan 1/2 data (never same-day or later).
+        expected = math.log(105.0 / 100.0)
+        assert abs(series.at(date(2026, 1, 5)) - expected) < 1e-9
+        assert abs(series.at(date(2026, 1, 4)) - 0.0) < 1e-9  # before any entry exists yet
+
+    def test_date_before_any_data_returns_zero(self):
+        series = build_daily_lagged_return_series(
+            [PriceBar(datetime(2026, 1, 1, tzinfo=UTC), 100.0)]
+        )
+        assert series.at(date(2025, 1, 1)) == 0.0
+
+    def test_empty_series_returns_zero(self):
+        from gold_edge.learning.historical_gold import DailyLaggedSeries
+
+        assert DailyLaggedSeries().at(date(2026, 1, 1)) == 0.0

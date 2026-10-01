@@ -17,7 +17,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -34,11 +34,15 @@ from gold_edge.feeds.kalshi_rest import KalshiRestClient
 from gold_edge.feeds.kalshi_ws import KalshiWsClient
 from gold_edge.feeds.pyth import PythFeedClient, get_market_hours
 from gold_edge.learning.actions import PromoteOutcome, promote_proposal, rollback_config
+from gold_edge.learning.drift import check_drift
+from gold_edge.learning.drift_metrics import baseline_from_evidence, compute_live_drift_metrics
 from gold_edge.learning.insights import session_report_card
+from gold_edge.learning.model_loader import LoadedModel, load_active_model
 from gold_edge.learning.opportunities import filter_scorecard
 from gold_edge.learning.queries import (
     load_config_versions,
     load_latest_drift_event,
+    load_model_versions,
     load_pattern_stats,
     load_proposals,
     load_session_data,
@@ -153,6 +157,8 @@ def _build_state_payload(
     settlement_source_ok: bool | None = None,
     pyth_market_open: bool | None = None,
     price_source: str | None = None,
+    raw_fair: FairValue | None = None,
+    active_model_version: str | None = None,
 ) -> dict[str, Any]:
     pyth_stale = pyth_age_s is None or pyth_age_s > stale_s
     kalshi_stale = kalshi_age_s is None or kalshi_age_s > stale_s
@@ -164,6 +170,17 @@ def _build_state_payload(
             {"s": latest_price, **(_book_to_json(book) or {})} if book else {"s": latest_price}
         ),
         "fair": {"yes": fair.yes, "no": fair.no} if fair is not None else None,
+        # Present only when a promoted model is active and actually
+        # changed the number `fair` shows above -- so the dashboard/API can
+        # always display "model says X, raw baseline says Y" and a
+        # promoted model is never a black box (CLAUDE.md: "keep the
+        # baseline available for comparison").
+        "raw_fair": (
+            {"yes": raw_fair.yes, "no": raw_fair.no}
+            if raw_fair is not None and active_model_version is not None
+            else None
+        ),
+        "active_model_version": active_model_version,
         "position": _position_to_json(engine_state.position, book, fees_cfg),
         "signal": _signal_to_json(engine_state.pending_signal)
         if engine_state.pending_signal is not None
@@ -314,6 +331,13 @@ class AppState:
     book: BookSnapshot | None = None
     kalshi_receive_time: datetime | None = None
     fair: FairValue | None = None
+    # The unmodified baseline (CLAUDE.md: "keep the baseline available for
+    # comparison") -- always computed, regardless of whether `active_model`
+    # replaces `fair` with a promoted market+model blend. Loaded once at
+    # startup only; see model_loader.py for why it can never crash the
+    # server (missing/stale/tampered file all just mean "no active model").
+    raw_fair: FairValue | None = None
+    active_model: LoadedModel | None = None
 
     engine_state: EngineState = field(default_factory=EngineState)
     # The UTC calendar date `engine_state.realized_pnl_today` has been
@@ -417,6 +441,10 @@ class AppState:
             settlement_source_ok=self.settlement_source_ok,
             price_source=price_source,
             pyth_market_open=self.pyth_market_open,
+            raw_fair=self.raw_fair,
+            active_model_version=(
+                self.active_model.artifact.version_hash if self.active_model is not None else None
+            ),
         )
 
     async def broadcast(self) -> None:
@@ -443,7 +471,7 @@ async def _recompute_and_step(app: AppState) -> None:
         (now - app.kalshi_receive_time).total_seconds() if app.kalshi_receive_time else 999.0
     )
     tau_minutes = app.window.seconds_left(now) / 60.0
-    app.fair = compute_fair_value(
+    app.raw_fair = compute_fair_value(
         effective_price,
         float(app.window.s0),
         app.vol_tracker.sigma_per_minute,
@@ -451,6 +479,11 @@ async def _recompute_and_step(app: AppState) -> None:
         app.settings.model.min_fair_value,
         app.settings.model.max_fair_value,
     )
+    if app.active_model is not None:
+        market_mid = float((app.book.yes_bid + app.book.yes_ask) / 2)
+        app.fair = app.active_model.predict_fair(market_mid, app.raw_fair.yes)
+    else:
+        app.fair = app.raw_fair
 
     async with app._lock:
         if app.kill_switch and app.engine_state.position_state is PositionState.FLAT:
@@ -588,6 +621,62 @@ async def _pyth_market_hours_loop(app: AppState) -> None:
         except Exception as exc:  # noqa: BLE001 - must not let this task die
             logger.warning("Pyth market-hours check failed (%s)", exc)
         await asyncio.sleep(60)
+
+
+DRIFT_CHECK_INTERVAL_S = 300.0  # "Rolling live checks" (CLAUDE.md) -- low frequency by design
+DRIFT_ROLLING_WINDOW_DAYS = 3.0
+
+
+async def _check_drift_once(app: AppState) -> None:
+    """One drift check cycle: find the most recently promoted config OR
+    model version (whichever shipped last), rebuild the `DriftBaseline` it
+    was promoted against from its stored evidence, compute live
+    `DriftMetrics` over a trailing rolling window, and record the result --
+    the dashboard's Live/Review/Learning tabs already poll
+    `load_latest_drift_event` (see `_build_state_payload` and the
+    `/api/learning` handlers) so nothing else needs to change to surface
+    this. Inert (does nothing) until a config or model version is actually
+    promoted and enough graded history exists -- never raises into the
+    caller's loop."""
+    if app.recorder is None:
+        return
+    sqlite_path = app.settings.sqlite_path
+    promoted = [v for v in load_config_versions(sqlite_path) if v.promoted] + [
+        v for v in load_model_versions(sqlite_path) if v.promoted
+    ]
+    if not promoted:
+        return
+    current = max(promoted, key=lambda v: v.created_at)
+    baseline = baseline_from_evidence(current.evidence)
+    if baseline is None:
+        return
+    now = datetime.now(UTC)
+    since = now - timedelta(days=DRIFT_ROLLING_WINDOW_DAYS)
+    live = compute_live_drift_metrics(sqlite_path, since, now)
+    if live is None:
+        return
+    event = check_drift(baseline, live, now)
+    await app.recorder.record_drift_event(
+        event.degraded_metrics, event.suggestion, event.detected_at
+    )
+    if event.has_drift:
+        app.log(
+            kind="warning",
+            payload={"warning": "drift detected", "degraded_metrics": event.degraded_metrics,
+                      "suggestion": event.suggestion},
+        )
+
+
+async def _drift_loop(app: AppState) -> None:
+    """Never changes config itself (CLAUDE.md: "Drift alerts never change
+    config automatically") -- only ever records a `DriftEvent` for the
+    dashboard and session log to show."""
+    while True:
+        await asyncio.sleep(DRIFT_CHECK_INTERVAL_S)
+        try:
+            await _check_drift_once(app)
+        except Exception:
+            logger.exception("drift check failed; continuing")
 
 
 async def _handle_window_closed(app: AppState) -> None:
@@ -772,6 +861,10 @@ def _settings_with_promoted_config(settings: Settings, sqlite_path: Path) -> Set
 def create_app(settings: Settings, signer: KalshiSigner, pyth_api_key: str) -> FastAPI:
     settings = _settings_with_promoted_config(settings, settings.sqlite_path)
     app_state = AppState(settings=settings, signer=signer, pyth_api_key=pyth_api_key)
+    # Loaded once here, never re-read mid-session (CLAUDE.md: "no change
+    # mid-session") -- load_active_model never raises, so a missing/stale/
+    # tampered model file just means the server runs on the raw baseline.
+    app_state.active_model = load_active_model(settings.learning.active_model_path)
 
     async def lifespan(_: FastAPI):
         app_state.recorder = Recorder(settings.sqlite_path)
@@ -791,6 +884,7 @@ def create_app(settings: Settings, signer: KalshiSigner, pyth_api_key: str) -> F
             asyncio.create_task(_proxy_loop(app_state)),
             asyncio.create_task(_ticker_loop(app_state)),
             asyncio.create_task(_pyth_market_hours_loop(app_state)),
+            asyncio.create_task(_drift_loop(app_state)),
         ]
         try:
             yield

@@ -26,7 +26,12 @@ from gold_edge.feeds.kalshi_auth import KalshiSigner
 from gold_edge.feeds.kalshi_rest import KalshiRestClient
 from gold_edge.feeds.kalshi_ws import KalshiWsClient
 from gold_edge.feeds.pyth import PythFeedClient
-from gold_edge.learning.actions import promote_proposal, rollback_config
+from gold_edge.learning.actions import (
+    promote_model,
+    promote_proposal,
+    rollback_config,
+    rollback_model,
+)
 from gold_edge.learning.blend import fit_blend, format_blend, walk_forward_blend
 from gold_edge.learning.blend_shadow import (
     BlendArtifact,
@@ -37,6 +42,7 @@ from gold_edge.learning.blend_shadow import (
     make_artifact,
     parse_market_quote,
 )
+from gold_edge.learning.calibrator import fit_isotonic_calibrator, should_promote_calibrator
 from gold_edge.learning.delay_profile import FillLatencySample
 from gold_edge.learning.feature_blend import (
     BASE,
@@ -46,8 +52,10 @@ from gold_edge.learning.feature_blend import (
     walk_forward,
 )
 from gold_edge.learning.historical_gold import (
+    DailyLaggedSeries,
     PriceBar,
     build_calibration_points,
+    build_daily_lagged_return_series,
     evaluate_historical_calibration,
     fetch_yahoo_chart,
     fit_gld_session_vol_multipliers,
@@ -61,10 +69,13 @@ from gold_edge.learning.history import (
     COINBASE_BASE,
     KALSHI_BASE,
     backfill_candles,
+    backfill_kraken_paxg,
     backfill_paxg,
     backfill_windows,
     densify,
+    load_kraken_paxg_bars,
     load_paxg_bars,
+    merge_consensus,
     open_history,
     parse_coinbase_candles,
 )
@@ -83,11 +94,12 @@ from gold_edge.learning.market_study import (
     proxy_agreement,
     save_gld_cache,
 )
+from gold_edge.learning.model_proposer import build_model_proposal, load_shadow_stats
 from gold_edge.learning.opportunities import filter_scorecard
 from gold_edge.learning.patterns import load_macro_events
 from gold_edge.learning.pipeline import run_learning_pipeline
 from gold_edge.learning.queries import load_proposals, load_session_data
-from gold_edge.learning.registry import RejectedProposal
+from gold_edge.learning.registry import RejectedProposal, evaluate_model_promotion_gates
 from gold_edge.model.fair_value import compute_fair_value
 from gold_edge.model.volatility import VolatilityTracker
 from gold_edge.models import BookSnapshot, Window
@@ -936,6 +948,13 @@ async def _run_backfill(settings: Settings, days: int, db: str) -> None:
                 client,
             )
             print(f"paxg: +{n} one-minute PAXG-USD closes from Coinbase (public, keyless)")
+            n = await backfill_kraken_paxg(
+                conn,
+                datetime.fromisoformat(lo) - timedelta(hours=1),
+                datetime.fromisoformat(hi) + timedelta(minutes=5),
+                client,
+            )
+            print(f"kraken_paxg: +{n} one-minute PAXG-USD closes from Kraken (public, keyless)")
     tw = conn.execute("SELECT COUNT(*) FROM kalshi_windows").fetchone()[0]
     tc = conn.execute("SELECT COUNT(DISTINCT ticker) FROM kalshi_candles").fetchone()[0]
     print(f"history db {db}: {tw} windows, {tc} with candles")
@@ -969,7 +988,9 @@ def _history_quote_fetcher(conn: sqlite3.Connection, mode: str = "next_open"):
     return quote_at
 
 
-def _history_windows(conn: sqlite3.Connection) -> tuple[list[WindowRef], dict[str, float]]:
+def _history_windows(
+    conn: sqlite3.Connection, start: datetime | None = None, end: datetime | None = None
+) -> tuple[list[WindowRef], dict[str, float]]:
     import math
 
     windows, truth = [], {}
@@ -977,7 +998,10 @@ def _history_windows(conn: sqlite3.Connection) -> tuple[list[WindowRef], dict[st
         "SELECT ticker, open_time, close_time, s0, settle_value, result FROM kalshi_windows "
         "ORDER BY open_time"
     ):
-        windows.append(WindowRef(ticker, datetime.fromisoformat(o), datetime.fromisoformat(c), res))
+        ot = datetime.fromisoformat(o)
+        if (start and ot < start) or (end and ot >= end):
+            continue
+        windows.append(WindowRef(ticker, ot, datetime.fromisoformat(c), res))
         if s0 and sv:
             truth[ticker] = math.log(sv / s0)
     return windows, truth
@@ -991,14 +1015,22 @@ FEATURE_SETS: dict[str, tuple[str, ...]] = {
     "+multi-vol": (*BASE, "logit_fair_h300", "logit_fair_h1800"),
     "+time-of-day": (*BASE, "hsin", "hcos"),
     "+paxg-momentum": (*BASE, "ret5z"),
+    "+dollar": (*BASE, "dxy_lag1"),
+    "+yield": (*BASE, "tnx_lag1"),
     "all": (
         *BASE, "fair_x_late", "mid_x_late", "mom1", "spread", "logvol",
-        "logit_fair_h300", "logit_fair_h1800", "hsin", "hcos", "ret5z",
+        "logit_fair_h300", "logit_fair_h1800", "hsin", "hcos", "ret5z", "dxy_lag1", "tnx_lag1",
     ),
 }
 
 
-def _history_extras(conn: sqlite3.Connection, settings: Settings, series: dict[float, GldSeries]):
+def _history_extras(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    series: dict[float, GldSeries],
+    dxy: DailyLaggedSeries | None = None,
+    tnx: DailyLaggedSeries | None = None,
+):
     import math
 
     from gold_edge.learning.blend import _logit
@@ -1026,6 +1058,8 @@ def _history_extras(conn: sqlite3.Connection, settings: Settings, series: dict[f
         out["ret5z"] = (
             math.log(s / p5) / (sigma5 * math.sqrt(5.0)) if s and p5 and sigma5 else 0.0
         )
+        out["dxy_lag1"] = dxy.at(w.open_time.date()) if dxy is not None else 0.0
+        out["tnx_lag1"] = tnx.at(w.open_time.date()) if tnx is not None else 0.0
         for half_life, key in ((300.0, "logit_fair_h300"), (1800.0, "logit_fair_h1800")):
             g = series[half_life]
             sg = g.sigma_at(t)
@@ -1044,15 +1078,29 @@ def _history_extras(conn: sqlite3.Connection, settings: Settings, series: dict[f
     return extra_at
 
 
-def _run_study_features(settings: Settings, db: str, holdout_days: int) -> None:
+async def _run_study_features(settings: Settings, db: str, holdout_days: int) -> None:
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     windows, _ = _history_windows(conn)
     bars = densify(load_paxg_bars(conn))
     short = settings.volatility.short_horizon_s
     series = {h: GldSeries(bars, h, short) for h in (300.0, 900.0, 1800.0)}
+    try:
+        dxy_bars = await fetch_yahoo_chart("DX-Y.NYB", "1d", "2y")
+        dxy = build_daily_lagged_return_series(dxy_bars)
+        print(f"dollar index (DX-Y.NYB): {len(dxy_bars)} daily closes fetched (free, keyless)")
+    except httpx.HTTPError as exc:
+        print(f"dollar index fetch failed ({exc!r}); '+dollar'/'all' will score dxy_lag1=0.0")
+        dxy = DailyLaggedSeries()
+    try:
+        tnx_bars = await fetch_yahoo_chart("^TNX", "1d", "2y")
+        tnx = build_daily_lagged_return_series(tnx_bars)
+        print(f"10y treasury yield (^TNX): {len(tnx_bars)} daily closes fetched (free, keyless)")
+    except httpx.HTTPError as exc:
+        print(f"treasury yield fetch failed ({exc!r}); '+yield'/'all' will score tnx_lag1=0.0")
+        tnx = DailyLaggedSeries()
     rows = build_study_rows(
         windows, series[900.0], _history_quote_fetcher(conn, "close"), settings.model, 1.5,
-        extra_at=_history_extras(conn, settings, series),
+        extra_at=_history_extras(conn, settings, series, dxy, tnx),
     )
     dev, hold = split_dev_holdout(rows, holdout_days)
     print(
@@ -1098,6 +1146,120 @@ def _run_study_features(settings: Settings, db: str, holdout_days: int) -> None:
     if chosen != "base" and finals[chosen] and finals["base"]:
         d, lo, hi = paired_diff(finals["base"], finals[chosen])
         print(f"holdout, {chosen} vs base: Brier gain {d:+.5f} CI [{lo:+.5f}, {hi:+.5f}]")
+
+
+def _run_propose_model(
+    settings: Settings, history_db: str, shadow_db: str, holdout_days: int, out: str, promote: bool
+) -> None:
+    """`gold-edge propose-model [--promote]`: the one CLI entry point for
+    the probability-model promotion path (registry.py's
+    `evaluate_model_promotion_gates`). Always re-fits fresh from the
+    current history + shadow data and prints the full gate evaluation;
+    only writes anything (a new model_versions row) when --promote is
+    given AND every gate passes -- calling it with --promote IS the user
+    approval, same convention `promote_proposal` already uses. Mirrors
+    `promote`/`rollback`'s existing UX: it prints what to put in
+    config.yaml rather than writing config.yaml itself."""
+    conn = sqlite3.connect(f"file:{history_db}?mode=ro", uri=True)
+    windows, _ = _history_windows(conn)
+    bars = densify(load_paxg_bars(conn))
+    half_life = 900.0
+    gld = GldSeries(bars, half_life, settings.volatility.short_horizon_s)
+    rows = build_study_rows(
+        windows, gld, _history_quote_fetcher(conn, "close"), settings.model, delay_s=1.5
+    )
+    dev, hold = split_dev_holdout(rows, holdout_days)
+    if not dev or not hold:
+        print(f"not enough history for a dev/holdout split (dev={len(dev)}, holdout={len(hold)})")
+        return
+
+    holdout_result = fit_and_score(dev, hold, BASE, n_boot=1000)
+    if holdout_result is None:
+        print("could not score a holdout result (too little data)")
+        return
+
+    n_dev_windows = len({r.ticker for r in dev})
+    model = fit_blend(dev)
+    now = datetime.now(UTC)
+
+    # Learned component #1 (CLAUDE.md): fit an isotonic calibrator on top of
+    # the blend's OWN dev-set predictions (same split the blend itself was
+    # fit on), then keep it only if it improves BOTH held-out Brier and
+    # log-loss over the blend alone -- never applied on backtest-looking-good
+    # alone, same discipline as everything else in this promotion path.
+    dev_preds = model.predict(dev)
+    dev_outcomes = [r.outcome for r in dev]
+    holdout_preds = model.predict(hold)
+    holdout_outcomes = [r.outcome for r in hold]
+    calibrator = fit_isotonic_calibrator(dev_preds, dev_outcomes)
+    calibrated_holdout_preds = calibrator.predict_many(holdout_preds)
+    kept_calibrator = should_promote_calibrator(
+        holdout_preds, calibrated_holdout_preds, holdout_outcomes
+    )
+    kind = "blend+isotonic" if kept_calibrator else "blend"
+    print(
+        f"isotonic calibrator: {'kept' if kept_calibrator else 'not kept'} "
+        f"(must improve both held-out Brier and log-loss over the blend alone)"
+    )
+
+    artifact = make_artifact(
+        model.weights, half_life, n_dev_windows, now,
+        calibrator=calibrator if kept_calibrator else None,
+    )
+    artifact.save(Path(out))
+    print(
+        f"Fit on {n_dev_windows} dev windows ({len(dev)} rows); "
+        f"weights={artifact.weights}  version={artifact.version_hash} -> {out}"
+    )
+
+    shadow_stats = load_shadow_stats(Path(shadow_db))
+    proposal = build_model_proposal(
+        kind, out, artifact.version_hash, BASE, n_dev_windows, holdout_result, shadow_stats, now
+    )
+    print()
+    print(proposal.rationale)
+
+    gate = evaluate_model_promotion_gates(
+        proposal.to_gate_evidence(), settings.learning, user_approved=promote
+    )
+    print()
+    if gate.passed:
+        print("ALL GATES PASSED.")
+    else:
+        print("Gates NOT cleared:")
+        for reason in gate.reasons:
+            print(f"  - {reason}")
+
+    if not promote:
+        print("\n(run with --promote once you're ready to approve this -- nothing was written)")
+        return
+
+    # The promotion registry (config_versions/model_versions/proposals)
+    # always lives in the recorder's main sqlite file, same as
+    # promote_proposal/rollback_config -- history_db/shadow_db are only
+    # inputs used to FIT and EVALUATE the candidate above.
+    outcome = promote_model(settings.sqlite_path, proposal, settings.learning)
+    if outcome.gate_result.passed:
+        assert outcome.promoted_version is not None
+        print(f"\nPromoted model version {outcome.promoted_version.version_hash}.")
+        print("Set this in config.yaml's `learning:` section before the next `live` session:")
+        print(f"  active_model_path: {out}")
+    else:
+        print("\nNOT promoted -- failed gate(s):")
+        for reason in outcome.gate_result.reasons:
+            print(f"  - {reason}")
+
+
+def _run_rollback_model(settings: Settings) -> None:
+    restored = rollback_model(settings.sqlite_path)
+    if restored is None:
+        print("No promoted model version to roll back from.")
+        return
+    print(f"Rolled back. Now active (if any): {restored.version_hash}")
+    print(
+        "Update config.yaml's `learning.active_model_path` accordingly (or unset it to run "
+        "on the raw baseline)."
+    )
 
 
 def _run_train_blend(settings: Settings, db: str, half_life: float, out: str) -> None:
@@ -1243,12 +1405,20 @@ def _run_shadow_report(settings: Settings, db: str) -> None:
 
 
 def _run_study_history(
-    settings: Settings, db: str, quote_mode: str, shift_min: int, half_lives: list[float]
+    settings: Settings,
+    db: str,
+    quote_mode: str,
+    shift_min: int,
+    half_lives: list[float],
+    start: str | None = None,
+    end: str | None = None,
 ) -> None:
     import math
 
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    windows, truth = _history_windows(conn)
+    start_dt = datetime.fromisoformat(start).replace(tzinfo=UTC) if start else None
+    end_dt = datetime.fromisoformat(end).replace(tzinfo=UTC) if end else None
+    windows, truth = _history_windows(conn, start_dt, end_dt)
     bars = densify(load_paxg_bars(conn))
     if shift_min:
         # PLACEBO: delay the price series so it no longer lines up with the
@@ -1304,6 +1474,36 @@ def _run_study_history(
                         f"mean_net_pnl/contract=${h.mean_pnl:+.3f}  "
                         f"95% CI [${h.ci_low:+.3f}, ${h.ci_high:+.3f}]"
                     )
+
+
+def _run_study_proxies(settings: Settings, db: str, half_life: float) -> None:
+    """Stage 4 experiment #1 (plan): is Kraken's PAXG-USD a BETTER free gold
+    proxy than Coinbase's, or does a median-of-both consensus beat either
+    alone? `proxy_agreement` against Kalshi's true settlement is the exact
+    audit CLAUDE.md-style honesty requires before any new source gets
+    anywhere near a feature -- this command only reports that audit, it
+    never wires a new source into the blend by itself."""
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    windows, _ = _history_windows(conn)
+    coinbase = densify(load_paxg_bars(conn))
+    kraken = densify(load_kraken_paxg_bars(conn))
+    consensus = merge_consensus(coinbase, kraken)
+    print(
+        f"{len(windows)} settled windows; Coinbase PAXG bars={len(coinbase)}  "
+        f"Kraken PAXG bars={len(kraken)}  consensus (median) bars={len(consensus)}"
+    )
+    for label, bars in (("Coinbase PAXG", coinbase), ("Kraken PAXG", kraken),
+                         ("consensus (median)", consensus)):
+        if not bars:
+            print(f"{label}: no data -- run `gold-edge backfill` first")
+            continue
+        gld = GldSeries(bars, half_life, settings.volatility.short_horizon_s)
+        compared, agree = proxy_agreement(windows, gld)
+        if compared == 0:
+            print(f"{label}: no windows overlap this source's coverage")
+            continue
+        print(f"{label}: outcome agreement vs Kalshi settlement {agree}/{compared} "
+              f"({agree / compared:.1%})")
 
 
 async def _run_study_market(
@@ -1443,6 +1643,8 @@ def main(argv: list[str] | None = None) -> None:
         "walk-forward learned blend (offline).",
     )
     history_study_parser.add_argument("--db", default="data/history.sqlite")
+    history_study_parser.add_argument("--start", help="ISO datetime; only windows opening at/after")
+    history_study_parser.add_argument("--end", help="ISO datetime; only windows opening before")
     history_study_parser.add_argument(
         "--quote-mode", choices=["next_open", "close"], default="close"
     )
@@ -1451,12 +1653,37 @@ def main(argv: list[str] | None = None) -> None:
         "--half-life", type=float, action="append", dest="half_lives"
     )
 
+    proxies_parser = sub.add_parser(
+        "study-proxies",
+        help="Audit free gold-proxy sources (Coinbase PAXG, Kraken PAXG, and a median "
+        "consensus of both) against Kalshi's true settlement, before trusting any of them "
+        "in a feature.",
+    )
+    proxies_parser.add_argument("--db", default="data/history.sqlite")
+    proxies_parser.add_argument("--half-life", type=float, default=900.0)
+
     features_parser = sub.add_parser(
         "study-features",
         help="Test richer blend features with a dev walk-forward and a one-shot holdout.",
     )
     features_parser.add_argument("--db", default="data/history.sqlite")
     features_parser.add_argument("--holdout-days", type=int, default=14)
+
+    propose_model_parser = sub.add_parser(
+        "propose-model",
+        help="Fit the market+model blend fresh and evaluate it against every promotion gate "
+        "(holdout Brier CI + live-shadow trade count/days/P&L CI). Prints the gate result; "
+        "only writes anything with --promote, and only if every gate passes.",
+    )
+    propose_model_parser.add_argument("--history-db", default="data/history.sqlite")
+    propose_model_parser.add_argument("--shadow-db", default="data/shadow.sqlite")
+    propose_model_parser.add_argument("--holdout-days", type=int, default=14)
+    propose_model_parser.add_argument("--out", default="data/blend_model.json")
+    propose_model_parser.add_argument(
+        "--promote", action="store_true", help="Approve and persist if every gate passes"
+    )
+
+    sub.add_parser("rollback-model", help="Restore the previously promoted model version.")
 
     train_parser = sub.add_parser(
         "train-blend", help="Fit the market+model blend on the backfilled history -> artifact."
@@ -1518,8 +1745,16 @@ def main(argv: list[str] | None = None) -> None:
         _run_promote(settings, args.proposal_id)
     elif args.command == "rollback":
         _run_rollback(settings)
+    elif args.command == "study-proxies":
+        _run_study_proxies(settings, args.db, args.half_life)
     elif args.command == "study-features":
-        _run_study_features(settings, args.db, args.holdout_days)
+        asyncio.run(_run_study_features(settings, args.db, args.holdout_days))
+    elif args.command == "propose-model":
+        _run_propose_model(
+            settings, args.history_db, args.shadow_db, args.holdout_days, args.out, args.promote
+        )
+    elif args.command == "rollback-model":
+        _run_rollback_model(settings)
     elif args.command == "train-blend":
         _run_train_blend(settings, args.db, args.half_life, args.out)
     elif args.command == "shadow":
@@ -1533,6 +1768,8 @@ def main(argv: list[str] | None = None) -> None:
             args.quote_mode,
             args.shift_min,
             args.half_lives or [settings.volatility.ewma_half_life_s, 900.0],
+            args.start,
+            args.end,
         )
     elif args.command == "backfill":
         asyncio.run(_run_backfill(settings, args.days, args.db))

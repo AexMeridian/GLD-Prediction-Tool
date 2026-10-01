@@ -28,10 +28,11 @@ for the full explanation and its limitations, especially:
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 
 import httpx
 
@@ -95,6 +96,49 @@ async def fetch_yahoo_chart(
         )
         resp.raise_for_status()
     return parse_yahoo_chart_json(resp.json())
+
+
+@dataclass(frozen=True)
+class DailyLaggedSeries:
+    """A date-keyed macro feature (e.g. a dollar-index or treasury-yield
+    daily close), exposed only as its own LAGGED one-day return so a lookup
+    for any date never contains information from that date or later.
+    Forward-filled across non-trading days (weekends/holidays) via `.at` --
+    the daily series' own feed (Yahoo) is thin relative to Kalshi's near-24/5
+    gold windows, the same gap `densify` fills for minute bars."""
+
+    dates: list[date] = field(default_factory=list)
+    values: list[float] = field(default_factory=list)
+
+    def at(self, d: date) -> float:
+        """The most recently known lagged return at or before `d`, or 0.0
+        (no information / feature absent) if `d` precedes all known data --
+        consistent with `feature_value`'s own `extras.get(name, 0.0)`
+        fallback for an unknown feature."""
+        i = bisect.bisect_right(self.dates, d) - 1
+        return self.values[i] if i >= 0 else 0.0
+
+
+def build_daily_lagged_return_series(bars: Sequence[PriceBar]) -> DailyLaggedSeries:
+    """For each bar after the first two, the log return between the two
+    PRECEDING bars' closes, indexed under the later bar's own date -- i.e.
+    "the most recent fully-known daily return as of this date's open,"
+    never a same-day or future move."""
+    ordered = sorted(bars, key=lambda b: b.timestamp)
+    dates: list[date] = []
+    values: list[float] = []
+    for i in range(2, len(ordered)):
+        prev, prev2 = ordered[i - 1], ordered[i - 2]
+        if prev.close <= 0 or prev2.close <= 0:
+            continue
+        d = ordered[i].timestamp.date()
+        r = math.log(prev.close / prev2.close)
+        if dates and dates[-1] == d:
+            values[-1] = r
+        else:
+            dates.append(d)
+            values.append(r)
+    return DailyLaggedSeries(dates, values)
 
 
 def _stdev(values: Sequence[float]) -> float:

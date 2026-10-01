@@ -21,7 +21,7 @@ from gold_edge.learning.insights import GradedTrade
 from gold_edge.learning.opportunities import FilterEvent, Opportunity
 from gold_edge.learning.patterns import BucketStat
 from gold_edge.learning.proposer import Proposal
-from gold_edge.learning.registry import ConfigVersion
+from gold_edge.learning.registry import ConfigVersion, ModelVersion
 from gold_edge.models import Side
 
 
@@ -164,6 +164,33 @@ def load_config_versions(sqlite_path: Path) -> list[ConfigVersion]:
         )
         for row in rows
     ]
+
+
+def load_model_versions(sqlite_path: Path) -> list[ModelVersion]:
+    """`artifact_path` has no dedicated column in `model_versions` (unlike
+    `config_versions`' `param_changes_json`) -- `promote_model` (actions.py)
+    folds it into `evidence["artifact_path"]` instead of migrating the
+    schema, so it's read back from there."""
+    conn = sqlite3.connect(sqlite_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM model_versions ORDER BY created_at").fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        evidence = json.loads(row["evidence_json"])
+        out.append(
+            ModelVersion(
+                version_hash=row["version_hash"],
+                kind=row["kind"],
+                artifact_path=evidence.get("artifact_path", ""),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                evidence=evidence,
+                promoted=bool(row["promoted"]),
+            )
+        )
+    return out
 
 
 def load_latest_drift_event(sqlite_path: Path) -> DriftEvent | None:

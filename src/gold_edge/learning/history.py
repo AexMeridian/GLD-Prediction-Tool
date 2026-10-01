@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,7 @@ from gold_edge.learning.historical_gold import PriceBar
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 COINBASE_BASE = "https://api.exchange.coinbase.com"
+KRAKEN_BASE = "https://api.kraken.com/0/public"
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 SCHEMA = """
@@ -41,6 +43,7 @@ CREATE TABLE IF NOT EXISTS kalshi_candles (
     volume REAL, PRIMARY KEY (ticker, end_ts)
 );
 CREATE TABLE IF NOT EXISTS paxg_1m (ts INTEGER PRIMARY KEY, close REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS kraken_paxg_1m (ts INTEGER PRIMARY KEY, close REAL NOT NULL);
 """
 
 
@@ -105,6 +108,21 @@ def parse_coinbase_candles(rows: Sequence[Sequence[float]]) -> list[PriceBar]:
     """Coinbase row = [start_epoch, low, high, open, close, volume]; a minute
     with no trades is simply absent (PAXG is thin), handled by `densify`."""
     return [PriceBar(datetime.fromtimestamp(int(r[0]), tz=UTC), float(r[4])) for r in rows]
+
+
+def parse_kraken_candles(rows: Sequence[Sequence[Any]]) -> list[PriceBar]:
+    """Kraken OHLC row = [time, open, high, low, close, vwap, volume, count]
+    (price fields as strings). Kraken itself carries the last close forward
+    into minutes with no trade (volume "0.00000000", OHLC all equal) --
+    those aren't real price discovery, so they're dropped here and left to
+    `densify` to fill, the same "a minute with no trades is simply absent"
+    convention already used for Coinbase's PAXG candles."""
+    out = []
+    for r in rows:
+        if float(r[6]) <= 0:
+            continue
+        out.append(PriceBar(datetime.fromtimestamp(int(r[0]), tz=UTC), float(r[4])))
+    return out
 
 
 def densify(bars: Sequence[PriceBar], max_gap_min: int = 10) -> list[PriceBar]:
@@ -242,8 +260,78 @@ async def backfill_paxg(
     return added
 
 
+async def backfill_kraken_paxg(
+    conn: sqlite3.Connection, since: datetime, until: datetime, client: httpx.AsyncClient
+) -> int:
+    """Kraken serves up to 720 one-minute candles per call, and `since` can be
+    passed to page forward using the response's own `last` cursor as the next
+    `since` -- BUT in practice Kraken's free public OHLC endpoint only ever
+    has roughly the trailing ~12 hours of 1-minute data available, no matter
+    how far back `since` points (confirmed empirically: a `since` 60 days in
+    the past still only returned the most recent ~700 candles). Unlike
+    Coinbase's candles endpoint (which does serve deep history), Kraken PAXG
+    is therefore NOT usable for backtesting against `kalshi_windows` history
+    -- `gold-edge study-proxies` found only ~40 overlapping settled windows
+    even after a 60-day backfill request. It's still collected here because
+    it's free and harmless, and could become a genuine live second-exchange
+    input for `gold-edge shadow` (forward-collected consensus/dislocation,
+    same caveat as the plan's order-flow-imbalance idea) -- just not a
+    historical feature today."""
+    added = 0
+    cursor = int(since.timestamp())
+    until_ts = until.timestamp()
+    while cursor < until_ts:
+        data = await _get(
+            client, f"{KRAKEN_BASE}/OHLC", {"pair": "PAXGUSD", "interval": 1, "since": cursor}
+        )
+        if data.get("error"):
+            break
+        result = data.get("result", {})
+        keys = [k for k in result if k != "last"]
+        if not keys:
+            break
+        rows = result[keys[0]]
+        if not rows:
+            break
+        for b in parse_kraken_candles(rows):
+            c = conn.execute(
+                "INSERT OR IGNORE INTO kraken_paxg_1m VALUES (?,?)",
+                (int(b.timestamp.timestamp()), b.close),
+            )
+            added += c.rowcount
+        next_cursor = int(result.get("last", cursor))
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+        await asyncio.sleep(0.5)
+    conn.commit()
+    return added
+
+
+def merge_consensus(*bar_lists: Sequence[PriceBar]) -> list[PriceBar]:
+    """Per-minute median across however many of the given (already densified)
+    series actually have a price at that minute -- reduces single-exchange
+    noise without requiring every source to be present at every minute."""
+    by_ts: dict[int, list[float]] = {}
+    for bars in bar_lists:
+        for b in bars:
+            by_ts.setdefault(int(b.timestamp.timestamp()), []).append(b.close)
+    out = [
+        PriceBar(datetime.fromtimestamp(ts, tz=UTC), statistics.median(prices))
+        for ts, prices in by_ts.items()
+    ]
+    return sorted(out, key=lambda b: b.timestamp)
+
+
 def load_paxg_bars(conn: sqlite3.Connection) -> list[PriceBar]:
     return [
         PriceBar(datetime.fromtimestamp(ts, tz=UTC), c)
         for ts, c in conn.execute("SELECT ts, close FROM paxg_1m ORDER BY ts")
+    ]
+
+
+def load_kraken_paxg_bars(conn: sqlite3.Connection) -> list[PriceBar]:
+    return [
+        PriceBar(datetime.fromtimestamp(ts, tz=UTC), c)
+        for ts, c in conn.execute("SELECT ts, close FROM kraken_paxg_1m ORDER BY ts")
     ]
