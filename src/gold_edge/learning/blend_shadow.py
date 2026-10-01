@@ -171,6 +171,13 @@ class PriceState:
     def sigma(self) -> float | None:
         return self._vol.sigma_per_minute if self._bars >= MIN_WARMUP_BARS else None
 
+    @property
+    def short_horizon_sigma(self) -> float | None:
+        """For `engine_cfg`'s vol-spike filter (`risk.vol_ok`) -- `None`
+        before enough recent samples exist, same "not enough data" meaning
+        the live engine itself uses for this field."""
+        return self._vol.short_horizon_sigma_per_minute if self._bars >= MIN_WARMUP_BARS else None
+
 
 SHADOW_SCHEMA = """
 CREATE TABLE IF NOT EXISTS shadow_observations (

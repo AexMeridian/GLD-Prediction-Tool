@@ -100,6 +100,12 @@ from gold_edge.learning.patterns import load_macro_events
 from gold_edge.learning.pipeline import run_learning_pipeline
 from gold_edge.learning.queries import load_proposals, load_session_data
 from gold_edge.learning.registry import RejectedProposal, evaluate_model_promotion_gates
+from gold_edge.learning.shadow_full import (
+    FullShadowEngine,
+    FullShadowStore,
+    FullShadowWindow,
+    market_to_book_snapshot,
+)
 from gold_edge.model.fair_value import compute_fair_value
 from gold_edge.model.volatility import VolatilityTracker
 from gold_edge.models import BookSnapshot, Window
@@ -1404,6 +1410,114 @@ def _run_shadow_report(settings: Settings, db: str) -> None:
     )
 
 
+async def _run_shadow_full(settings: Settings, artifact_path: str, db: str) -> None:
+    """`gold-edge shadow-full`: a SECOND, parallel shadow track (see
+    learning/shadow_full.py) that reuses the real engine state machine so a
+    window can take multiple round trips, instead of blend_shadow.py's one-
+    trade-per-window simplification. Writes to its own db; never touches or
+    reads blend_shadow.py's data/shadow.sqlite."""
+    artifact = BlendArtifact.load(Path(artifact_path))
+    prices = PriceState(artifact.half_life_s, settings.volatility.short_horizon_s)
+    store = FullShadowStore(Path(db))
+    engine = FullShadowEngine(
+        artifact, settings.model, settings.fees, settings.engine,
+        settings.volatility.vol_spike_limit, prices, store,
+    )
+    windows: dict[str, FullShadowWindow] = {}
+    print(
+        f"FULL SHADOW mode (no orders, no API keys; multi-round-trip via the real state "
+        f"machine). blend {artifact.version_hash} weights={artifact.weights} -> {db}",
+        flush=True,
+    )
+    async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        n = await _seed_prices(client, prices)
+        print(f"seeded {n} minutes of PAXG history; sigma={prices.sigma}", flush=True)
+        feed = asyncio.create_task(
+            _supervised("shadow-full-feed", lambda: _shadow_feed(settings, prices))
+        )
+        last_boundary: datetime | None = None
+        last_settle = datetime.now(UTC)
+        try:
+            while True:
+                now = datetime.now(UTC)
+                boundary = now.replace(second=0, microsecond=0)
+                if boundary != last_boundary and (now - boundary).total_seconds() >= 1.5:
+                    last_boundary = boundary
+                    try:
+                        prices.advance(boundary)
+                        data = await _history_get(
+                            client,
+                            f"{KALSHI_BASE}/markets",
+                            {"series_ticker": settings.kalshi.series_ticker,
+                             "status": "open", "limit": 20},
+                        )
+                        for m in data.get("markets", []):
+                            o = datetime.fromisoformat(m["open_time"].replace("Z", "+00:00"))
+                            c = datetime.fromisoformat(m["close_time"].replace("Z", "+00:00"))
+                            if not (o <= boundary < c):
+                                continue
+                            w = windows.setdefault(m["ticker"], FullShadowWindow(m["ticker"], o, c))
+                            for msg in engine.on_boundary(
+                                w, boundary, market_to_book_snapshot(m, now)
+                            ):
+                                print(f"{boundary:%H:%M} {msg}", flush=True)
+                    except Exception as exc:  # noqa: BLE001 - keep the shadow alive
+                        print(f"shadow-full step error ({exc!r}); continuing", flush=True)
+                if (now - last_settle).total_seconds() >= 20:
+                    last_settle = now
+                    for ticker in list(engine.open_rows):
+                        try:
+                            mk = (
+                                await _history_get(client, f"{KALSHI_BASE}/markets/{ticker}", {})
+                            ).get("market", {})
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if mk.get("result") in ("yes", "no"):
+                            msg = engine.settle_if_still_open(ticker, mk["result"])
+                            if msg:
+                                print(msg, flush=True)
+                await asyncio.sleep(0.25)
+        finally:
+            feed.cancel()
+
+
+def _run_shadow_full_report(settings: Settings, db: str) -> None:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    trades = conn.execute(
+        "SELECT ticker, side, pnl, substr(entry_ts,1,10) FROM shadow_full_round_trips "
+        "WHERE pnl IS NOT NULL"
+    ).fetchall()
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM shadow_full_round_trips WHERE pnl IS NULL"
+    ).fetchone()[0]
+    n_windows = conn.execute(
+        "SELECT COUNT(DISTINCT ticker) FROM shadow_full_round_trips"
+    ).fetchone()[0]
+    print(
+        f"round trips settled: {len(trades)} across {n_windows} windows  pending: {pending}  "
+        "(NOTE: instant synthetic fills, not human-paced -- see shadow_full.py's docstring)"
+    )
+    if not trades:
+        print("no settled round trips yet")
+        return
+    pnls: dict[str, list[float]] = {}
+    for ticker, _side, pnl, _day in trades:
+        pnls.setdefault(ticker, []).append(pnl)
+    mean, lo, hi = _cluster_bootstrap(pnls, 2000, random.Random(0))
+    wins = sum(1 for t in trades if t[2] > 0)
+    days = len({t[3] for t in trades})
+    need = settings.learning.min_proposal_trades
+    print(
+        f"win rate {wins / len(trades):.1%}   mean net P&L/round-trip ${mean:+.3f}   "
+        f"95% CI [${lo:+.3f}, ${hi:+.3f}]"
+    )
+    print(
+        f"volume progress: {len(trades)}/{need} settled round trips, {days}/"
+        f"{settings.learning.shadow_sessions} days.  Not wired into propose-model's gates yet "
+        "-- see shadow_full.py's docstring on why its P&L isn't directly comparable."
+    )
+
+
 def _run_study_history(
     settings: Settings,
     db: str,
@@ -1704,6 +1818,20 @@ def main(argv: list[str] | None = None) -> None:
     report_parser = sub.add_parser("shadow-report", help="Summarise shadow results vs the gates.")
     report_parser.add_argument("--db", default="data/shadow.sqlite")
 
+    shadow_full_parser = sub.add_parser(
+        "shadow-full",
+        help="Run the blend LIVE using the REAL entry/exit/flip state machine (multiple round "
+        "trips per window), not blend_shadow.py's one-trade-per-window simplification. Writes "
+        "to its own db; never orders, never touches data/shadow.sqlite.",
+    )
+    shadow_full_parser.add_argument("--artifact", default="data/blend_model.json")
+    shadow_full_parser.add_argument("--db", default="data/shadow_full.sqlite")
+
+    full_report_parser = sub.add_parser(
+        "shadow-full-report", help="Summarise shadow-full round-trip volume and P&L."
+    )
+    full_report_parser.add_argument("--db", default="data/shadow_full.sqlite")
+
     study_parser = sub.add_parser(
         "study-market",
         help="Score the fair-value model against real recorded Kalshi prices on settled "
@@ -1761,6 +1889,10 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_run_shadow(settings, args.artifact, args.db, args.threshold))
     elif args.command == "shadow-report":
         _run_shadow_report(settings, args.db)
+    elif args.command == "shadow-full":
+        asyncio.run(_run_shadow_full(settings, args.artifact, args.db))
+    elif args.command == "shadow-full-report":
+        _run_shadow_full_report(settings, args.db)
     elif args.command == "study-history":
         _run_study_history(
             settings,
