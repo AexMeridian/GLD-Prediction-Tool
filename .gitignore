@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-data/*.sqlite
+data/*.sqlite*
+data/*.json
 data/parquet/
 *.egg-info/
